@@ -1,0 +1,416 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+<META http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<!--
+This HTML was auto-generated from MATLAB code.
+To make changes, update the MATLAB code and republish this document.
+      -->
+<title>3D Visualization using Gaussian Splatting</title>
+<meta name="generator" content="MATLAB 25.2">
+<link rel="schema.DC" href="http://purl.org/dc/elements/1.1/">
+<meta name="DC.date" content="2026-01-15">
+<meta name="DC.source" content="trainGaussianSplat.m">
+<style type="text/css">
+html,body,div,span,applet,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,a,abbr,acronym,address,big,cite,code,del,dfn,em,font,img,ins,kbd,q,s,samp,small,strike,strong,tt,var,b,u,i,center,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}body{line-height:1}ol,ul{list-style:none}blockquote,q{quotes:none}blockquote:before,blockquote:after,q:before,q:after{content:'';content:none}:focus{outine:0}ins{text-decoration:none}del{text-decoration:line-through}table{border-collapse:collapse;border-spacing:0}
+
+html { min-height:100%; margin-bottom:1px; }
+html body { height:100%; margin:0px; font-family:Arial, Helvetica, sans-serif; font-size:10px; color:#000; line-height:140%; background:#fff none; overflow-y:scroll; }
+html body td { vertical-align:top; text-align:left; }
+
+h1 { padding:0px; margin:0px 0px 25px; font-family:Arial, Helvetica, sans-serif; font-size:1.5em; color:#d55000; line-height:100%; font-weight:normal; }
+h2 { padding:0px; margin:0px 0px 8px; font-family:Arial, Helvetica, sans-serif; font-size:1.2em; color:#000; font-weight:bold; line-height:140%; border-bottom:1px solid #d6d4d4; display:block; }
+h3 { padding:0px; margin:0px 0px 5px; font-family:Arial, Helvetica, sans-serif; font-size:1.1em; color:#000; font-weight:bold; line-height:140%; }
+
+a { color:#005fce; text-decoration:none; }
+a:hover { color:#005fce; text-decoration:underline; }
+a:visited { color:#004aa0; text-decoration:none; }
+
+p { padding:0px; margin:0px 0px 20px; }
+img { padding:0px; margin:0px 0px 20px; border:none; }
+p img, pre img, tt img, li img, h1 img, h2 img { margin-bottom:0px; }
+
+ul { padding:0px; margin:0px 0px 20px 23px; list-style:square; }
+ul li { padding:0px; margin:0px 0px 7px 0px; }
+ul li ul { padding:5px 0px 0px; margin:0px 0px 7px 23px; }
+ul li ol li { list-style:decimal; }
+ol { padding:0px; margin:0px 0px 20px 0px; list-style:decimal; }
+ol li { padding:0px; margin:0px 0px 7px 23px; list-style-type:decimal; }
+ol li ol { padding:5px 0px 0px; margin:0px 0px 7px 0px; }
+ol li ol li { list-style-type:lower-alpha; }
+ol li ul { padding-top:7px; }
+ol li ul li { list-style:square; }
+
+.content { font-size:1.2em; line-height:140%; padding: 20px; }
+
+pre, code { font-size:12px; }
+tt { font-size: 1.2em; }
+pre { margin:0px 0px 20px; }
+pre.codeinput { padding:10px; border:1px solid #d3d3d3; background:#f7f7f7; }
+pre.codeoutput { padding:10px 11px; margin:0px 0px 20px; color:#4c4c4c; }
+pre.error { color:red; }
+
+@media print { pre.codeinput, pre.codeoutput { word-wrap:break-word; width:100%; } }
+
+span.keyword { color:#0000FF }
+span.comment { color:#228B22 }
+span.string { color:#A020F0 }
+span.untermstring { color:#B20000 }
+span.syscmd { color:#B28C00 }
+span.typesection { color:#A0522D }
+
+.footer { width:auto; padding:10px 0px; margin:25px 0px 0px; border-top:1px dotted #878787; font-size:0.8em; line-height:140%; font-style:italic; color:#878787; text-align:left; float:none; }
+.footer p { margin:0px; }
+.footer a { color:#878787; }
+.footer a:hover { color:#878787; text-decoration:underline; }
+.footer a:visited { color:#878787; }
+
+table th { padding:7px 5px; text-align:left; vertical-align:middle; border: 1px solid #d6d4d4; font-weight:bold; }
+table td { padding:7px 5px; text-align:left; vertical-align:top; border:1px solid #d6d4d4; }
+
+
+
+
+
+  </style>
+</head>
+<body>
+<div class="content">
+<h1>Train 3D Gaussian Splatting (3DGS)</h1>
+<!--introduction-->
+<p>This example shows how-to train and generate 2D images using a minimal implementation of 3D Gaussian splatting.</p>
+<!--/introduction-->
+<h2>Contents</h2>
+<div>
+<ul>
+<li>
+<a href="#1">Load Data</a>
+</li>
+<li>
+<a href="#2">Define Learnable Parameters</a>
+</li>
+<li>
+<a href="#3">Specify Training Options</a>
+</li>
+<li>
+<a href="#5">Train Model</a>
+</li>
+<li>
+<a href="#14">Preview Results</a>
+</li>
+</ul>
+</div>
+<h2 id="1">Load Data</h2>
+<p>Specify the folder containing the SFM generated sparse 3d pointcloud as input, generated in COLMAP format. Download example dataset from <a href="https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip">https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip</a>.</p>
+<pre class="codeinput">datasetPath  = <span class="string">'C:\Source\tandt_db\tandt\train'</span>; <span class="comment">% Update this path</span>
+numGaussians = 2000;
+numImages    = 10;
+</pre>
+<h2 id="2">Define Learnable Parameters</h2>
+<p>Construct object and to load data and create learnable parameters</p>
+<pre class="codeinput">obj = GaussianSplatter(datasetPath, numGaussians, numImages);
+</pre>
+<pre class="codeoutput">Loading COLMAP data from C:\Source\tandt_db\tandt\train\sparse\0...
+Loading cameras...
+Loading images...
+Loading 3D points...
+Loaded: 1 cameras, 301 images, 182686 points3D
+Processing metadata...
+Initializing Gaussians...
+scene scale: 0.780833
+</pre>
+<h2 id="3">Specify Training Options</h2>
+<p>Train for 50 epochs with a mini-batch size of 1.</p>
+<pre class="codeinput">miniBatchSize = 1;
+numEpochs     = ceil(numGaussians/20);
+</pre>
+<p>Specify the options for Adam optimization:</p>
+<pre class="codeinput">learnRate     = 0.01;
+learnInterval = ceil(numEpochs/5);
+gradDecay     = 0.9;
+sqGradDecay   = 0.999;
+</pre>
+<h2 id="5">Train Model</h2>
+<p>Train the 3D Gaussian splat model using a custom training loop.</p>
+<p>Training the model is a computationally expensive process that can take hours. To save time while running this example, load a pretrained network by setting doTraining to false. To train the network yourself, set doTraining to true.</p>
+<pre class="codeinput">doTraining = true;
+</pre>
+<p>Create a minibatchqueue object that processes and manages mini-batches of images and camera data during training.</p>
+<pre class="codeinput">ds = combine(obj.data.images, obj.data.cameras); <span class="comment">% Combined datastore</span>
+mbq = minibatchqueue(ds,<span class="string">'MiniBatchSize'</span>,miniBatchSize, <span class="keyword">...</span>
+    <span class="string">'PartialMiniBatch'</span>,<span class="string">'discard'</span>,<span class="string">'OutputEnvironment'</span>,<span class="string">'auto'</span>,<span class="keyword">...</span>
+    <span class="string">'MiniBatchFor'</span>,[<span class="string">"SSCB"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"SSB"</span>,<span class="string">"SB"</span>,<span class="string">"SB"</span>]);
+</pre>
+<p>Adaptive densification</p>
+<pre class="codeinput">enableAdaptiveDensification = true;
+densifyInterval = ceil(numEpochs/10);
+prunningRatio = 0.05;
+</pre>
+<p>Initialize the parameters for Adam optimization.</p>
+<pre class="codeinput">avgGrad = [];
+avgSqGrad = [];
+</pre>
+<p>Calculate the total number of iterations for the training progress monitor</p>
+<pre class="codeinput">numIterationsPerEpoch = ceil(numImages/miniBatchSize);
+numIterations = numEpochs * numIterationsPerEpoch;
+</pre>
+<p>Initialize the training progress monitor</p>
+<pre class="codeinput">
+<span class="keyword">if</span> doTraining
+    monitor = trainingProgressMonitor(<span class="string">'Metrics'</span>,<span class="string">"Loss"</span>,<span class="string">'Info'</span>,<span class="string">"Epoch"</span>,<span class="string">'XLabel'</span>,<span class="string">"Iteration"</span>);
+<span class="keyword">end</span>
+</pre>
+<pre class="codeinput">imageIdxToShow = preview(obj.data.cameras);
+imageIdxToShow = imageIdxToShow{1};
+</pre>
+<p>Train the model using a custom training loop. For each epoch, shuffle the images and camera data and loop over mini-batches. At the end of each iteration, display the training progress.</p>
+<pre class="codeinput">
+<span class="keyword">if</span> doTraining
+    iteration = 0;
+    epoch = 0;
+    <span class="keyword">while</span> epoch &lt; numEpochs &amp;&amp; ~monitor.Stop
+        epoch = epoch + 1;
+
+        <span class="comment">% Shuffle data</span>
+        shuffle(mbq);
+
+        <span class="keyword">while</span> hasdata(mbq) &amp;&amp; ~monitor.Stop
+            iteration = iteration + 1;
+
+            <span class="comment">% Fetch Data</span>
+            [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,<span class="keyword">...</span>
+                obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,<span class="keyword">...</span><span class="comment">.</span>
+                obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+
+            <span class="keyword">if</span> (iteration == 1)
+                <span class="comment">% Initialize storage and move to GPU if input is on GPU</span>
+                obj.initStorage(miniBatchSize);
+            <span class="keyword">end</span>
+
+            <span class="comment">% Optimization Step</span>
+            [loss,grads] = dlfeval(@obj.modelStep,obj.params);
+
+            <span class="comment">% Update Weights</span>
+            [obj.params,avgGrad,avgSqGrad] = adamupdate(obj.params,grads,avgGrad,avgSqGrad,iteration,learnRate,gradDecay,sqGradDecay);
+
+            <span class="comment">% Extract Loss Value</span>
+            loss = extractdata(loss);
+
+            <span class="comment">% Update the training progress monitor</span>
+            recordMetrics(monitor,iteration,Loss=loss);
+            updateInfo(monitor,Epoch=epoch + <span class="string">" of "</span> + numEpochs);
+            monitor.Progress = 100 * iteration/numIterations;
+
+            <span class="comment">% Visualization</span>
+            idx = find(extractdata(obj.camera.id) == imageIdxToShow);
+            <span class="keyword">if</span> ~isempty(idx)
+                figure(1);
+                imshow(extractdata(obj.image(:,:,:,idx)));
+                title(sprintf(<span class="string">'Epoch %d | Loss: %.4f'</span>, epoch, loss));
+                drawnow;
+            <span class="keyword">end</span>
+        <span class="keyword">end</span>
+
+        <span class="comment">% Adaptive densification</span>
+        <span class="keyword">if</span> enableAdaptiveDensification &amp;&amp; mod(epoch, densifyInterval) == 0 &amp;&amp; epoch &gt; 1 &amp;&amp; epoch &lt; numEpochs
+            obj.pruneAndDensify(avgGrad,prunningRatio);
+        <span class="keyword">end</span>
+
+        <span class="comment">% Decrease learning rate</span>
+        <span class="keyword">if</span> mod(epoch, learnInterval) == 0 &amp;&amp; epoch &gt; 1 &amp;&amp; epoch &lt; numEpochs
+            learnRate = 0.5*learnRate;
+        <span class="keyword">end</span>
+    <span class="keyword">end</span>
+
+    <span class="comment">% Save params</span>
+    obj.saveGaussians(<span class="string">"gaussians.mat"</span>);
+<span class="keyword">end</span>
+</pre>
+<pre class="codeoutput">Densification: 4 clones, 96 splits. 
+Densification: 17 clones, 82 splits. 
+Densification: 33 clones, 66 splits. 
+Densification: 32 clones, 54 splits. 
+Densification: 54 clones, 31 splits. 
+Densification: 36 clones, 39 splits. 
+Densification: 32 clones, 38 splits. 
+Densification: 31 clones, 31 splits. 
+Densification: 16 clones, 39 splits. 
+</pre>
+<img vspace="5" hspace="5" src="trainGaussianSplat_03.png" alt=""> <img vspace="5" hspace="5" src="trainGaussianSplat_04.png" alt=""> <h2 id="14">Preview Results</h2>
+<pre class="codeinput">load(<span class="string">"gaussians.mat"</span>);
+obj.camera = cell2struct(preview(obj.data.cameras),[<span class="string">"id"</span>,<span class="string">"width"</span>,<span class="string">"height"</span>,<span class="string">"fx"</span>,<span class="string">"fy"</span>,<span class="string">"cx"</span>,<span class="string">"cy"</span>,<span class="string">"Rcw"</span>,<span class="string">"tcw"</span>,<span class="string">"twc"</span>],2);
+obj.initStorage(length(obj.camera));
+obj.projectGaussiansWithCulling(params);
+renderedImg = extractdata(obj.image);
+<span class="keyword">if</span> size(renderedImg,4) &gt; 1
+    renderedImg = imtile(renderedImg);
+<span class="keyword">end</span>
+figure
+imshow(renderedImg)
+title(<span class="string">"Generated Images"</span>)
+</pre>
+<img vspace="5" hspace="5" src="trainGaussianSplat_05.png" alt=""> <p class="footer">
+<br>
+<a href="https://www.mathworks.com/products/matlab/">Published with MATLAB&reg; R2025b</a>
+<br>
+</p>
+</div>
+<!--
+##### SOURCE BEGIN #####
+%% Train 3D Gaussian Splatting (3DGS)
+% This example shows how-to train and generate 2D images using a 
+% minimal implementation of 3D Gaussian splatting.
+
+%% Load Data
+% Specify the folder containing the SFM generated sparse 3d pointcloud as
+% input, generated in COLMAP format. Download example dataset from
+% <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
+datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
+numGaussians = 2000;
+numImages    = 10;
+
+%% Define Learnable Parameters
+% Construct object and to load data and create learnable parameters
+obj = GaussianSplatter(datasetPath, numGaussians, numImages);
+
+%% Specify Training Options
+% Train for 50 epochs with a mini-batch size of 1.
+miniBatchSize = 1;
+numEpochs     = ceil(numGaussians/20);
+
+%%
+% Specify the options for Adam optimization:
+learnRate     = 0.01;
+learnInterval = ceil(numEpochs/5);
+gradDecay     = 0.9;
+sqGradDecay   = 0.999;
+
+
+%% Train Model
+% Train the 3D Gaussian splat model using a custom training loop. 
+
+%%
+% Training the model is a computationally expensive process that can take
+% hours. To save time while running this example, load a pretrained network
+% by setting doTraining to false. To train the network yourself, set
+% doTraining to true.
+doTraining = true;
+
+%%
+% Create a minibatchqueue object that processes and manages mini-batches of
+% images and camera data during training. 
+ds = combine(obj.data.images, obj.data.cameras); % Combined datastore
+mbq = minibatchqueue(ds,'MiniBatchSize',miniBatchSize, ...
+    'PartialMiniBatch','discard','OutputEnvironment','auto',...
+    'MiniBatchFor',["SSCB","B","B","B","B","B","B","B","SSB","SB","SB"]);
+
+%%
+% Adaptive densification
+enableAdaptiveDensification = true;
+densifyInterval = ceil(numEpochs/10);
+prunningRatio = 0.05;
+
+%%
+% Initialize the parameters for Adam optimization.
+avgGrad = [];
+avgSqGrad = [];
+
+%%
+% Calculate the total number of iterations for the training progress monitor
+numIterationsPerEpoch = ceil(numImages/miniBatchSize);
+numIterations = numEpochs * numIterationsPerEpoch;
+
+%%
+% Initialize the training progress monitor
+if doTraining
+    monitor = trainingProgressMonitor('Metrics',"Loss",'Info',"Epoch",'XLabel',"Iteration");
+end
+
+%%
+% Initialize the preview render
+imageIdxToShow = preview(obj.data.cameras);
+imageIdxToShow = imageIdxToShow{1};
+
+%%
+% Train the model using a custom training loop. For each epoch, shuffle the
+% images and camera data and loop over mini-batches. At the end of each
+% iteration, display the training progress.
+if doTraining
+    iteration = 0;
+    epoch = 0;
+    while epoch < numEpochs && ~monitor.Stop
+        epoch = epoch + 1;
+
+        % Shuffle data
+        shuffle(mbq);
+
+        while hasdata(mbq) && ~monitor.Stop
+            iteration = iteration + 1;
+
+            % Fetch Data
+            [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,...
+                obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,....
+                obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+
+            if (iteration == 1)
+                % Initialize storage and move to GPU if input is on GPU
+                obj.initStorage(miniBatchSize);
+            end
+
+            % Optimization Step
+            [loss,grads] = dlfeval(@obj.modelStep,obj.params);
+
+            % Update Weights
+            [obj.params,avgGrad,avgSqGrad] = adamupdate(obj.params,grads,avgGrad,avgSqGrad,iteration,learnRate,gradDecay,sqGradDecay);
+
+            % Extract Loss Value
+            loss = extractdata(loss);
+
+            % Update the training progress monitor
+            recordMetrics(monitor,iteration,Loss=loss);
+            updateInfo(monitor,Epoch=epoch + " of " + numEpochs);
+            monitor.Progress = 100 * iteration/numIterations;
+
+            % Visualization
+            idx = find(extractdata(obj.camera.id) == imageIdxToShow);
+            if ~isempty(idx)
+                figure(1);
+                imshow(extractdata(obj.image(:,:,:,idx)));
+                title(sprintf('Epoch %d | Loss: %.4f', epoch, loss));
+                drawnow;
+            end
+        end
+
+        % Adaptive densification
+        if enableAdaptiveDensification && mod(epoch, densifyInterval) == 0 && epoch > 1 && epoch < numEpochs
+            obj.pruneAndDensify(avgGrad,prunningRatio);
+        end
+
+        % Decrease learning rate
+        if mod(epoch, learnInterval) == 0 && epoch > 1 && epoch < numEpochs
+            learnRate = 0.5*learnRate;
+        end
+    end
+
+    % Save params
+    obj.saveGaussians("gaussians.mat");
+end
+
+%% Preview Results
+load("gaussians.mat");
+obj.camera = cell2struct(preview(obj.data.cameras),["id","width","height","fx","fy","cx","cy","Rcw","tcw","twc"],2);
+obj.initStorage(length(obj.camera));
+obj.projectGaussiansWithCulling(params);
+renderedImg = extractdata(obj.image);
+if size(renderedImg,4) > 1
+    renderedImg = imtile(renderedImg);
+end
+figure
+imshow(renderedImg)
+title("Generated Images")
+
+
+##### SOURCE END #####
+-->
+</body>
+</html>
