@@ -12,13 +12,6 @@ classdef GaussianSplatter < handle
 
         % Loss Weights
         lambda = single(0.2);
-
-        % Kernel Functions
-        fcnSOS     = @(x,y) (x.^2 + y.^2);
-        fcnSigmoid = @(x) single(1.0)./(single(1.0) + exp(-x));
-        fcnInv     = @(x) single(1.0)./max(x,single(1e-6));
-        fcnColor   = @(x) max(min(single(0.5) + single(0.28209479177387814).*x,single(1.0)),single(0.0));
-        fcnZScale  = @(x) x./max(sqrt(sum(x.^2, 2),single(1e-6)));
     end
 
     properties
@@ -52,6 +45,7 @@ classdef GaussianSplatter < handle
         window
         X
         Y
+        XY
         T
 
         % Kernel Functions
@@ -94,9 +88,10 @@ classdef GaussianSplatter < handle
             % Initialize Storage
             this.image = dlarray(zeros(this.imageHeight,this.imageWidth,3,this.miniBatchSize,'single'),'SSCB');
             this.window = repmat(this.window,1,1,1,miniBatchSize);
-            [this.X, this.Y] = meshgrid(1:single(this.imageWidth), 1:single(this.imageHeight));
-            this.X = dlarray(repmat(this.X,1,1,1,this.miniBatchSize), 'SSCB');
-            this.Y = dlarray(repmat(this.Y,1,1,1,this.miniBatchSize), 'SSCB');
+            [this.X, this.Y] = meshgrid(1:uint32(this.imageWidth), 1:uint32(this.imageHeight));
+            this.XY = dlarray(repmat(single(this.X.^2 + this.Y.^2),1,1,1,this.miniBatchSize), 'SSCB');
+            this.X = dlarray(repmat(single(this.X),1,1,1,this.miniBatchSize), 'SSCB');
+            this.Y = dlarray(repmat(single(this.Y),1,1,1,this.miniBatchSize), 'SSCB');
             this.T = dlarray(ones(this.imageHeight,this.imageWidth,1,this.miniBatchSize,'single'), 'SSCB');
 
             % Kernel Function
@@ -176,14 +171,12 @@ classdef GaussianSplatter < handle
             this.gaussians(:,1,:) = this.gaussians(:,1,:).*valid;
             this.gaussians(:,2,:) = this.gaussians(:,2,:).*valid;
             this.gaussians(:,3,:) = this.gaussians(:,3,:).*valid;
-            %alphas = dlarray(reshape(repmat(arrayfun(this.fcnSigmoid,params.alphas_raw),1,1,this.miniBatchSize).*valid,this.numGaussians,1,1,this.miniBatchSize),'SSCB');
             alphas = dlarray(reshape(repmat(single(1.0)./(single(1.0) + exp(-params.alphas_raw)),1,1,this.miniBatchSize).*valid,this.numGaussians,1,1,this.miniBatchSize),'SSCB');
 
             % Compute Covariance 3D -> 2D using simplified 2D radii (Projected Splat)
             radius = dlarray(reshape(repmat(max(exp(params.scales_raw),[],2),1,1,this.miniBatchSize).*inv_z.*reshape(this.camera.fx,1,1,this.miniBatchSize),this.numGaussians,1,1,this.miniBatchSize),'SSCB');
 
             % Render (Splatting) using "Weighted Sum of Gaussians at Pixel Centers"
-            %colors = dlarray(reshape(repmat(arrayfun(this.fcnColor,params.shs),1,1,this.miniBatchSize),this.numGaussians,1,3,this.miniBatchSize),'SSCB');
             colors = dlarray(reshape(repmat(max(min(single(0.5) + single(0.28209479177387814).*params.shs,single(1.0)),single(0.0)),1,1,this.miniBatchSize),this.numGaussians,1,3,this.miniBatchSize),'SSCB');
 
             % Sort by depth (Painter's Algorithm)
@@ -206,7 +199,11 @@ classdef GaussianSplatter < handle
             % Processing Loop
             for k = 1:max(nr_valid)
                 % Gaussian falloff to mask to ignore far pixels
-                alphaT = (this.X - u(k,:,:,:)).^single(2) + (this.Y - v(k,:,:,:)).^single(2);
+                alphaT = this.XY;
+                alphaT = alphaT - (single(2.0).*u(k,:,:,:)).*this.X;
+                alphaT = alphaT - (single(2.0).*v(k,:,:,:)).*this.Y;
+                alphaT = alphaT + u(k,:,:,:).^single(2.0);
+                alphaT = alphaT + v(k,:,:,:).^single(2.0);
                 alphaT = alphaT.*(-single(1.5)./max(radius(k,:,:,:).^2,single(1e-6)));
                 alphaT = exp(alphaT);
                 alphaT = alphas(k,:,:,:).*alphaT; 
@@ -263,17 +260,17 @@ classdef GaussianSplatter < handle
             % Replace pruned gaussians with cloned or splitted gaussians
             numPrune = sum(shouldPrune);
             if numPrune
-			    % Select indices to be pruned
-			    pruneIdx = pruneIdx(shouldPrune);
-				
+                % Select indices to be pruned
+                pruneIdx = pruneIdx(shouldPrune);
+                
                 % Sort based on largest positional gradient
-				%  - Large position gradient -> complex shape -> increase density
+                %  - Large position gradient -> complex shape -> increase density
                 [~,cloneIdx] = sort(vecnorm(avgGrad.pws,2,2),'descend');
-				
-				% Remove indices that are to be pruned
-				cloneIdx = setdiff(extractdata(cloneIdx),extractdata(pruneIdx),'stable');
-				
-				% Select indices to cloned
+                
+                % Remove indices that are to be pruned
+                cloneIdx = setdiff(extractdata(cloneIdx),extractdata(pruneIdx),'stable');
+                
+                % Select indices to cloned
                 cloneIdx = cloneIdx(1:numPrune);
 
                 % Identify candidates for split
@@ -283,7 +280,7 @@ classdef GaussianSplatter < handle
                 this.params.pws(pruneIdx,:) = this.params.pws(cloneIdx,:);
                 this.params.alphas_raw(pruneIdx,:) = this.params.alphas_raw(cloneIdx,:);
                 this.params.scales_raw(pruneIdx,:) = this.params.scales_raw(cloneIdx,:) - shouldSplit(cloneIdx,:).*this.splitScaleFactor;
-				this.params.scales_raw(cloneIdx,:) = this.params.scales_raw(cloneIdx,:) - shouldSplit(cloneIdx,:).*this.splitScaleFactor;
+                this.params.scales_raw(cloneIdx,:) = this.params.scales_raw(cloneIdx,:) - shouldSplit(cloneIdx,:).*this.splitScaleFactor;
                 this.params.rots_raw(pruneIdx,:) = this.params.rots_raw(cloneIdx,:);
                 this.params.shs(pruneIdx,:) = this.params.shs(cloneIdx,:);
 

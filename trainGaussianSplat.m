@@ -7,7 +7,7 @@
 % input, generated in COLMAP format. Download example dataset from
 % <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
 datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 2000;
+numGaussians = 4000;
 numImages    = 10;
 
 %% Define Learnable Parameters
