@@ -1,5 +1,5 @@
 classdef GaussianSplatter < handle
-    % GaussianSplattingTrainer 
+    % GaussianSplattingTrainer
     % MATLAB implementation of 3D Gaussian Splatting training loop.
 
     properties (Constant, Access=private)
@@ -50,7 +50,7 @@ classdef GaussianSplatter < handle
         % Kernel Functions
         fcnValid
     end
-    
+
     methods
         function this = GaussianSplatter(datasetPath, numGaussians, numImages)
             % Constructor: Load data and initialize params
@@ -106,11 +106,11 @@ classdef GaussianSplatter < handle
                 this.params.alphas_raw = gpuArray(this.params.alphas_raw);
                 this.params.rots_raw = gpuArray(this.params.rots_raw);
 
-                this.image = gpuArray(this.image); 
+                this.image = gpuArray(this.image);
                 this.window = gpuArray(this.window);
-                this.X = gpuArray(this.X); 
-                this.Y = gpuArray(this.Y); 
-                this.T = gpuArray(this.T); 
+                this.X = gpuArray(this.X);
+                this.Y = gpuArray(this.Y);
+                this.T = gpuArray(this.T);
             end
         end
 
@@ -119,7 +119,7 @@ classdef GaussianSplatter < handle
 
             % Forward Pass
             this.camera = structfun(@stripdims,this.camera,'UniformOutput',false);
-            this.projectGaussiansWithCulling(params);
+            this.createImage(params);
 
             % L1 Loss
             l1_loss = mean(abs(this.image - this.image_gt), 'all');
@@ -134,7 +134,34 @@ classdef GaussianSplatter < handle
             grads = dlgradient(loss, params);
         end
 
-        function projectGaussiansWithCulling(this,params)
+        function createImage(this,params)
+            % Create image uisng Gaussian Splatting
+
+            % Projects Gaussians with Frustum Culling and renders them
+            [u,v,alphas,radius,colors] = this.projectGaussiansWithCulling(params);
+
+            % A simplified Gaussian Splatting Rasterizer
+            for k = 1:length(alphas)
+                % Gaussian falloff to mask to ignore far pixels
+                alphaT = this.XY;
+                alphaT = alphaT - (single(2.0).*u(k,:,:,:)).*this.X;
+                alphaT = alphaT - (single(2.0).*v(k,:,:,:)).*this.Y;
+                alphaT = alphaT + u(k,:,:,:).^single(2.0);
+                alphaT = alphaT + v(k,:,:,:).^single(2.0);
+                alphaT = alphaT.*(-single(1.5)./max(radius(k,:,:,:).^2,single(1e-6)));
+                alphaT = exp(alphaT);
+                alphaT = alphas(k,:,:,:).*alphaT;
+                alphaT = this.T.*alphaT;
+
+                % Update image
+                this.image(:,:,1,:) = this.image(:,:,1,:) + alphaT.*colors(k,:,1,:);
+                this.image(:,:,2,:) = this.image(:,:,2,:) + alphaT.*colors(k,:,2,:);
+                this.image(:,:,3,:) = this.image(:,:,3,:) + alphaT.*colors(k,:,3,:);
+                this.T = this.T - alphaT;
+            end
+        end
+
+        function [u,v,alphas,radius,colors] = projectGaussiansWithCulling(this,params)
             % Projects Gaussians with Frustum Culling and renders them
 
             % Project to Camera Space
@@ -148,14 +175,13 @@ classdef GaussianSplatter < handle
             gaussians(:,2,:) = gaussians(:,2,:).*inv_z.*reshape(this.camera.fy,1,1,this.miniBatchSize) + reshape(this.camera.cy,1,1,this.miniBatchSize);
 
             % Frustum Culling
-            %valid = arrayfun(this.fcnValid,gaussians(:,1,:),gaussians(:,2,:),gaussians(:,3,:));
             valid = (gaussians(:,3,:) > single(0.2)) &...
                 (gaussians(:,3,:) < single(100.0)) &...
                 (gaussians(:,1,:) > -single(this.imageWidth)*single(0.5)) &...
                 (gaussians(:,1,:) < single(this.imageWidth)*single(1.5)) & ...
                 (gaussians(:,2,:) > -single(this.imageHeight)*single(0.5)) &...
                 (gaussians(:,2,:) < single(this.imageHeight)*single(1.5));
-   
+
             % Reset image
             this.image(:) = 0;
             this.T(:) = 1;
@@ -163,6 +189,11 @@ classdef GaussianSplatter < handle
             % If no guassians splat in 2d image return empty image
             nr_valid = sum(valid,1);
             if ~any(nr_valid)
+                u = [];
+                v = [];
+                alphas = [];
+                radius = [];
+                colors = [];
                 return;
             end
 
@@ -170,49 +201,33 @@ classdef GaussianSplatter < handle
             gaussians(:,1,:) = gaussians(:,1,:).*valid;
             gaussians(:,2,:) = gaussians(:,2,:).*valid;
             gaussians(:,3,:) = gaussians(:,3,:).*valid;
+
+            % Outputs
+            u = dlarray(reshape(gaussians(:,1,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
+            v = dlarray(reshape(gaussians(:,2,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
             alphas = dlarray(reshape(repmat(single(1.0)./(single(1.0) + exp(-params.alphas_raw)),1,1,this.miniBatchSize).*valid,this.numGaussians,1,1,this.miniBatchSize),'SSCB');
-
-            % Compute Covariance 3D -> 2D using simplified 2D radii (Projected Splat)
             radius = dlarray(reshape(repmat(max(exp(params.scales_raw),[],2),1,1,this.miniBatchSize).*inv_z.*reshape(this.camera.fx,1,1,this.miniBatchSize),this.numGaussians,1,1,this.miniBatchSize),'SSCB');
-
-            % Render (Splatting) using "Weighted Sum of Gaussians at Pixel Centers"
             colors = dlarray(reshape(repmat(max(min(single(0.5) + single(0.28209479177387814).*params.shs,single(1.0)),single(0.0)),1,1,this.miniBatchSize),this.numGaussians,1,3,this.miniBatchSize),'SSCB');
 
             % Sort by depth (Painter's Algorithm)
-            u = dlarray(reshape(gaussians(:,1,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
-            v = dlarray(reshape(gaussians(:,2,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
             [~, sortIdx] = sort(gaussians(:,3,:), 'descend');
             for k = 1:this.miniBatchSize
                 u(:,:,:,k) = u(sortIdx(:,:,k),:,:,k);
                 v(:,:,:,k) = v(sortIdx(:,:,k),:,:,k);
+                alphas(:,:,:,k) = alphas(sortIdx(:,:,k),:,:,k);
                 radius(:,:,:,k) = radius(sortIdx(:,:,k),:,:,k);
                 colors(:,:,1,k) = colors(sortIdx(:,:,k),:,1,k);
                 colors(:,:,2,k) = colors(sortIdx(:,:,k),:,2,k);
                 colors(:,:,3,k) = colors(sortIdx(:,:,k),:,3,k);
-                alphas(:,:,:,k) = alphas(sortIdx(:,:,k),:,:,k);
             end
-            clear sortIdx gaussians inv_z; % reduce memory footprint before rasterizer
 
-            % A simplified Gaussian Splatting Rasterizer compatible with dlarray.
-            % This is brute-force compared to Tile-Based but functional for logic conversion.
-
-            % Processing Loop
-            for k = 1:max(nr_valid)
-                % Gaussian falloff to mask to ignore far pixels
-                alphaT = this.XY;
-                alphaT = alphaT - (single(2.0).*u(k,:,:,:)).*this.X;
-                alphaT = alphaT - (single(2.0).*v(k,:,:,:)).*this.Y;
-                alphaT = alphaT + u(k,:,:,:).^single(2.0);
-                alphaT = alphaT + v(k,:,:,:).^single(2.0);
-                alphaT = alphaT.*(-single(1.5)./max(radius(k,:,:,:).^2,single(1e-6)));
-                alphaT = exp(alphaT);
-                alphaT = alphas(k,:,:,:).*alphaT; 
-                alphaT = this.T.*alphaT;
-
-                % Update image
-                this.image = this.image + alphaT.*reshape(colors(k,:,:),1,1,3,this.miniBatchSize);
-                this.T = this.T - alphaT;
-            end
+            % Keep only valid gaussians
+            numValid = max(nr_valid);
+            u = u(1:numValid,:,:,:);
+            v = v(1:numValid,:,:,:);
+            alphas = alphas(1:numValid,:,:,:);
+            radius = radius(1:numValid,:,:,:);
+            colors = colors(1:numValid,:,:,:);
         end
 
         function ssim_val = ssimLoss(this)
@@ -262,14 +277,14 @@ classdef GaussianSplatter < handle
             if numPrune
                 % Select indices to be pruned
                 pruneIdx = pruneIdx(shouldPrune);
-                
+
                 % Sort based on largest positional gradient
                 %  - Large position gradient -> complex shape -> increase density
                 [~,cloneIdx] = sort(vecnorm(avgGrad.pws,2,2),'descend');
-                
+
                 % Remove indices that are to be pruned
                 cloneIdx = setdiff(extractdata(cloneIdx),extractdata(pruneIdx),'stable');
-                
+
                 % Select indices to cloned
                 cloneIdx = cloneIdx(1:numPrune);
 

@@ -141,7 +141,7 @@ end
 load("gaussians.mat");
 obj.camera = cell2struct(preview(obj.data.cameras),["id","width","height","fx","fy","cx","cy","Rcw","tcw","twc"],2);
 obj.initStorage(length(obj.camera));
-obj.projectGaussiansWithCulling(params);
+obj.createImage(params);
 renderedImg = extractdata(obj.image);
 if size(renderedImg,4) > 1
     renderedImg = imtile(renderedImg);
