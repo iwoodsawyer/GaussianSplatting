@@ -41,7 +41,6 @@ classdef GaussianSplatter < handle
         image
         image_gt
         camera
-        gaussians
         window
         X
         Y
@@ -139,23 +138,23 @@ classdef GaussianSplatter < handle
             % Projects Gaussians with Frustum Culling and renders them
 
             % Project to Camera Space
-            this.gaussians = pagemtimes(repmat(params.pws,1,1,this.miniBatchSize),'none',this.camera.Rcw,'transpose');
-            this.gaussians = this.gaussians + repmat(pagetranspose(reshape(this.camera.tcw,3,1,this.miniBatchSize)),size(params.pws,1),1,1);
+            gaussians = pagemtimes(repmat(params.pws,1,1,this.miniBatchSize),'none',this.camera.Rcw,'transpose');
+            gaussians = gaussians + repmat(pagetranspose(reshape(this.camera.tcw,3,1,this.miniBatchSize)),size(params.pws,1),1,1);
 
             % Project to Image Plane (Homogeneous division)
-            %inv_z = arrayfun(this.fcnInv, this.gaussians(:,3,:));
-            inv_z = single(1.0)./max(this.gaussians(:,3,:),single(1e-6));
-            this.gaussians(:,1,:) = this.gaussians(:,1,:).*inv_z.*reshape(this.camera.fx,1,1,this.miniBatchSize) + reshape(this.camera.cx,1,1,this.miniBatchSize);
-            this.gaussians(:,2,:) = this.gaussians(:,2,:).*inv_z.*reshape(this.camera.fy,1,1,this.miniBatchSize) + reshape(this.camera.cy,1,1,this.miniBatchSize);
+            %inv_z = arrayfun(this.fcnInv, gaussians(:,3,:));
+            inv_z = single(1.0)./max(gaussians(:,3,:),single(1e-6));
+            gaussians(:,1,:) = gaussians(:,1,:).*inv_z.*reshape(this.camera.fx,1,1,this.miniBatchSize) + reshape(this.camera.cx,1,1,this.miniBatchSize);
+            gaussians(:,2,:) = gaussians(:,2,:).*inv_z.*reshape(this.camera.fy,1,1,this.miniBatchSize) + reshape(this.camera.cy,1,1,this.miniBatchSize);
 
             % Frustum Culling
-            %valid = arrayfun(this.fcnValid,this.gaussians(:,1,:),this.gaussians(:,2,:),this.gaussians(:,3,:));
-            valid = (this.gaussians(:,3,:) > single(0.2)) &...
-                (this.gaussians(:,3,:) < single(100.0)) &...
-                (this.gaussians(:,1,:) > -single(this.imageWidth)*single(0.5)) &...
-                (this.gaussians(:,1,:) < single(this.imageWidth)*single(1.5)) & ...
-                (this.gaussians(:,2,:) > -single(this.imageHeight)*single(0.5)) &...
-                (this.gaussians(:,2,:) < single(this.imageHeight)*single(1.5));
+            %valid = arrayfun(this.fcnValid,gaussians(:,1,:),gaussians(:,2,:),gaussians(:,3,:));
+            valid = (gaussians(:,3,:) > single(0.2)) &...
+                (gaussians(:,3,:) < single(100.0)) &...
+                (gaussians(:,1,:) > -single(this.imageWidth)*single(0.5)) &...
+                (gaussians(:,1,:) < single(this.imageWidth)*single(1.5)) & ...
+                (gaussians(:,2,:) > -single(this.imageHeight)*single(0.5)) &...
+                (gaussians(:,2,:) < single(this.imageHeight)*single(1.5));
    
             % Reset image
             this.image(:) = 0;
@@ -168,9 +167,9 @@ classdef GaussianSplatter < handle
             end
 
             % Extract valid subsets
-            this.gaussians(:,1,:) = this.gaussians(:,1,:).*valid;
-            this.gaussians(:,2,:) = this.gaussians(:,2,:).*valid;
-            this.gaussians(:,3,:) = this.gaussians(:,3,:).*valid;
+            gaussians(:,1,:) = gaussians(:,1,:).*valid;
+            gaussians(:,2,:) = gaussians(:,2,:).*valid;
+            gaussians(:,3,:) = gaussians(:,3,:).*valid;
             alphas = dlarray(reshape(repmat(single(1.0)./(single(1.0) + exp(-params.alphas_raw)),1,1,this.miniBatchSize).*valid,this.numGaussians,1,1,this.miniBatchSize),'SSCB');
 
             % Compute Covariance 3D -> 2D using simplified 2D radii (Projected Splat)
@@ -180,9 +179,9 @@ classdef GaussianSplatter < handle
             colors = dlarray(reshape(repmat(max(min(single(0.5) + single(0.28209479177387814).*params.shs,single(1.0)),single(0.0)),1,1,this.miniBatchSize),this.numGaussians,1,3,this.miniBatchSize),'SSCB');
 
             % Sort by depth (Painter's Algorithm)
-            u = dlarray(reshape(this.gaussians(:,1,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
-            v = dlarray(reshape(this.gaussians(:,2,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
-            [~, sortIdx] = sort(this.gaussians(:,3,:), 'descend');
+            u = dlarray(reshape(gaussians(:,1,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
+            v = dlarray(reshape(gaussians(:,2,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
+            [~, sortIdx] = sort(gaussians(:,3,:), 'descend');
             for k = 1:this.miniBatchSize
                 u(:,:,:,k) = u(sortIdx(:,:,k),:,:,k);
                 v(:,:,:,k) = v(sortIdx(:,:,k),:,:,k);
@@ -192,6 +191,7 @@ classdef GaussianSplatter < handle
                 colors(:,:,3,k) = colors(sortIdx(:,:,k),:,3,k);
                 alphas(:,:,:,k) = alphas(sortIdx(:,:,k),:,:,k);
             end
+            clear sortIdx gaussians inv_z; % reduce memory footprint before rasterizer
 
             % A simplified Gaussian Splatting Rasterizer compatible with dlarray.
             % This is brute-force compared to Tile-Based but functional for logic conversion.
