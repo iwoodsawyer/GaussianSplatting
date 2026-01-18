@@ -86,12 +86,12 @@ classdef GaussianSplatter < handle
 
             % Initialize Storage
             this.image = dlarray(zeros(this.imageHeight,this.imageWidth,3,this.miniBatchSize,'single'),'SSCB');
-            this.window = repmat(this.window,1,1,1,miniBatchSize);
-            [this.X, this.Y] = meshgrid(1:uint32(this.imageWidth), 1:uint32(this.imageHeight));
-            this.XY = dlarray(repmat(single(this.X.^2 + this.Y.^2),1,1,1,this.miniBatchSize), 'SSCB');
-            this.X = dlarray(repmat(single(this.X),1,1,1,this.miniBatchSize), 'SSCB');
-            this.Y = dlarray(repmat(single(this.Y),1,1,1,this.miniBatchSize), 'SSCB');
-            this.T = dlarray(ones(this.imageHeight,this.imageWidth,1,this.miniBatchSize,'single'), 'SSCB');
+            
+            [Xi, Yi] = meshgrid(1:uint32(this.imageWidth), 1:uint32(this.imageHeight));
+            this.XY = dlarray(repmat(single(Xi.^2 + Yi.^2),1,1,1),'SSC');
+            this.X = dlarray(repmat(single(Xi),1,1,1),'SSC');
+            this.Y = dlarray(repmat(single(Yi),1,1,1),'SSC');
+            this.T = dlarray(ones(this.imageHeight,this.imageWidth,1,'single'), 'SSC');
 
             % Kernel Function
             this.fcnValid = @(x,y,z) (z > single(0.2)) && (z < single(100.0)) &&...
@@ -100,6 +100,7 @@ classdef GaussianSplatter < handle
 
             % Move to GPU if input is on GPU
             if isgpuarray(this.camera.id)
+                disp('More arrays to GPU environment...')
                 this.params.pws = gpuArray(this.params.pws);
                 this.params.shs = gpuArray(this.params.shs);
                 this.params.scales_raw = gpuArray(this.params.scales_raw);
@@ -137,27 +138,45 @@ classdef GaussianSplatter < handle
         function createImage(this,params)
             % Create image uisng Gaussian Splatting
 
+            % Reset image
+            this.image(:) = 0;
+
             % Projects Gaussians with Frustum Culling and renders them
             [u,v,alphas,radius,colors] = this.projectGaussiansWithCulling(params);
 
             % A simplified Gaussian Splatting Rasterizer
-            for k = 1:length(alphas)
-                % Gaussian falloff to mask to ignore far pixels
-                alphaT = this.XY;
-                alphaT = alphaT - (single(2.0).*u(k,:,:,:)).*this.X;
-                alphaT = alphaT - (single(2.0).*v(k,:,:,:)).*this.Y;
-                alphaT = alphaT + u(k,:,:,:).^single(2.0);
-                alphaT = alphaT + v(k,:,:,:).^single(2.0);
-                alphaT = alphaT.*(-single(1.5)./max(radius(k,:,:,:).^2,single(1e-6)));
-                alphaT = exp(alphaT);
-                alphaT = alphas(k,:,:,:).*alphaT;
-                alphaT = this.T.*alphaT;
+            for b = 1:this.miniBatchSize
+                this.T(:) = 1;
+                for k = 1:length(alphas)
+                    % Compute pixel region of influence
+                    radiusPixels = ceil(radius(k,:,:,b))*single(3.0); % 3-sigma coverage
+                    vmin = max(1, floor(v(k,:,:,b)) - radiusPixels);
+                    vmax = min(this.imageHeight, ceil(v(k,:,:,b)) + radiusPixels);
+                    umin = max(1, floor(u(k,:,:,b)) - radiusPixels);
+                    umax = min(this.imageWidth, ceil(u(k,:,:,b)) + radiusPixels);
 
-                % Update image
-                this.image(:,:,1,:) = this.image(:,:,1,:) + alphaT.*colors(k,:,1,:);
-                this.image(:,:,2,:) = this.image(:,:,2,:) + alphaT.*colors(k,:,2,:);
-                this.image(:,:,3,:) = this.image(:,:,3,:) + alphaT.*colors(k,:,3,:);
-                this.T = this.T - alphaT;
+                    % Gaussian falloff to mask to ignore far pixels
+                    alphaT = this.XY(vmin:vmax,umin:umax,:);
+                    alphaT = alphaT - (single(2.0).*u(k,:,:,b)).*this.X(vmin:vmax,umin:umax,:);
+                    alphaT = alphaT - (single(2.0).*v(k,:,:,b)).*this.Y(vmin:vmax,umin:umax,:);
+                    alphaT = alphaT + u(k,:,:,b).^single(2.0);
+                    alphaT = alphaT + v(k,:,:,b).^single(2.0);
+                    alphaT = alphaT.*(-single(1.5)./max(radius(k,:,:,b).^2,single(1e-6)));
+                    alphaT = exp(alphaT);
+                    alphaT = alphas(k,:,:,b).*alphaT;
+                    alphaT = this.T(vmin:vmax,umin:umax,1,1).*alphaT;
+
+                    % Update image
+                    this.image(vmin:vmax,umin:umax,1,b) = this.image(vmin:vmax,umin:umax,1,b) + alphaT.*colors(k,:,1,b);
+                    this.image(vmin:vmax,umin:umax,2,b) = this.image(vmin:vmax,umin:umax,2,b) + alphaT.*colors(k,:,2,b);
+                    this.image(vmin:vmax,umin:umax,3,b) = this.image(vmin:vmax,umin:umax,3,b) + alphaT.*colors(k,:,3,b);
+                    this.T(vmin:vmax,umin:umax,1,1) = this.T(vmin:vmax,umin:umax,1,1) - alphaT;
+
+                    % Early termination when fully opaque
+                    if mean(this.T, 'all') < 0.01
+                        break;
+                    end
+                end
             end
         end
 
@@ -182,10 +201,6 @@ classdef GaussianSplatter < handle
                 (gaussians(:,2,:) > -single(this.imageHeight)*single(0.5)) &...
                 (gaussians(:,2,:) < single(this.imageHeight)*single(1.5));
 
-            % Reset image
-            this.image(:) = 0;
-            this.T(:) = 1;
-
             % If no guassians splat in 2d image return empty image
             nr_valid = sum(valid,1);
             if ~any(nr_valid)
@@ -197,37 +212,27 @@ classdef GaussianSplatter < handle
                 return;
             end
 
-            % Extract valid subsets
-            gaussians(:,1,:) = gaussians(:,1,:).*valid;
-            gaussians(:,2,:) = gaussians(:,2,:).*valid;
-            gaussians(:,3,:) = gaussians(:,3,:).*valid;
-
-            % Outputs
-            u = dlarray(reshape(gaussians(:,1,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
-            v = dlarray(reshape(gaussians(:,2,:),this.numGaussians,1,1,this.miniBatchSize), 'SSCB');
-            alphas = dlarray(reshape(repmat(single(1.0)./(single(1.0) + exp(-params.alphas_raw)),1,1,this.miniBatchSize).*valid,this.numGaussians,1,1,this.miniBatchSize),'SSCB');
-            radius = dlarray(reshape(repmat(max(exp(params.scales_raw),[],2),1,1,this.miniBatchSize).*inv_z.*reshape(this.camera.fx,1,1,this.miniBatchSize),this.numGaussians,1,1,this.miniBatchSize),'SSCB');
-            colors = dlarray(reshape(repmat(max(min(single(0.5) + single(0.28209479177387814).*params.shs,single(1.0)),single(0.0)),1,1,this.miniBatchSize),this.numGaussians,1,3,this.miniBatchSize),'SSCB');
+            % Preallocate outputs
+            numValid = max(nr_valid);
+            u = dlarray(zeros(numValid,1,1,this.miniBatchSize), 'SSCB');
+            v = dlarray(zeros(numValid,1,1,this.miniBatchSize), 'SSCB');
+            alphas = dlarray(zeros(numValid,1,1,this.miniBatchSize), 'SSCB');
+            radius = dlarray(zeros(numValid,1,1,this.miniBatchSize), 'SSCB');
+            colors = dlarray(zeros(numValid,1,3,this.miniBatchSize), 'SSCB');
 
             % Sort by depth (Painter's Algorithm)
-            [~, sortIdx] = sort(gaussians(:,3,:), 'descend');
-            for k = 1:this.miniBatchSize
-                u(:,:,:,k) = u(sortIdx(:,:,k),:,:,k);
-                v(:,:,:,k) = v(sortIdx(:,:,k),:,:,k);
-                alphas(:,:,:,k) = alphas(sortIdx(:,:,k),:,:,k);
-                radius(:,:,:,k) = radius(sortIdx(:,:,k),:,:,k);
-                colors(:,:,1,k) = colors(sortIdx(:,:,k),:,1,k);
-                colors(:,:,2,k) = colors(sortIdx(:,:,k),:,2,k);
-                colors(:,:,3,k) = colors(sortIdx(:,:,k),:,3,k);
+            for b = 1:this.miniBatchSize
+                [~, sortIdx] = sort(gaussians(valid(:,:,b),3,b), 'descend');
+                validIdx = find(extractdata(valid(:,:,b)));
+                sortIdx = validIdx(sortIdx);
+                u(1:length(sortIdx),:,:,b) = gaussians(sortIdx,1,b);
+                v(1:length(sortIdx),:,:,b) = gaussians(sortIdx,2,b);
+                alphas(1:length(sortIdx),:,:,b) = single(1.0)./(single(1.0) + exp(-params.alphas_raw(sortIdx)));
+                radius(1:length(sortIdx),:,:,b) = max(exp(params.scales_raw(sortIdx,:)),[],2).*inv_z(sortIdx,:,b).*this.camera.fx(b);
+                colors(1:length(sortIdx),:,1,b) = max(min(single(0.5) + single(0.28209479177387814).*params.shs(sortIdx,1),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,2,b) = max(min(single(0.5) + single(0.28209479177387814).*params.shs(sortIdx,2),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,3,b) = max(min(single(0.5) + single(0.28209479177387814).*params.shs(sortIdx,3),single(1.0)),single(0.0));
             end
-
-            % Keep only valid gaussians
-            numValid = max(nr_valid);
-            u = u(1:numValid,:,:,:);
-            v = v(1:numValid,:,:,:);
-            alphas = alphas(1:numValid,:,:,:);
-            radius = radius(1:numValid,:,:,:);
-            colors = colors(1:numValid,:,:,:);
         end
 
         function ssim_val = ssimLoss(this)
@@ -252,7 +257,6 @@ classdef GaussianSplatter < handle
             % Average over all dimensions to get scalar
             ssim_val = mean(ssim_map, 'all');
         end
-
 
         function pruneAndDensify(this,avgGrad,prunningRatio)
             % Adaptive densification step
