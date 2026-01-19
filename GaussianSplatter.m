@@ -173,7 +173,7 @@ classdef GaussianSplatter < handle
                     this.T(vmin:vmax,umin:umax,1,1) = this.T(vmin:vmax,umin:umax,1,1) - alphaT;
 
                     % Early termination when fully opaque
-                    if mean(this.T, 'all') < 0.01
+                    if max(this.T, [], 'all') < 0.01
                         break;
                     end
                 end
