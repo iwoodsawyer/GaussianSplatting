@@ -237,8 +237,6 @@ classdef ColmapData < handle
             
             kScaleFactor = 1.1;
             scale = max(dists)*kScaleFactor;
-            
-            fprintf('scene scale: %f\n', scale);
         end
 
         function R = qVec2RotMat(qvec)
