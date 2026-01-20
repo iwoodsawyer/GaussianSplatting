@@ -1,4 +1,4 @@
-%% Train 3D Gaussian Splatting(3DGS)
+%% Train 3D Gaussian Splatting (3DGS)
 % This example shows how-to train and generate 2D images using a 
 % minimal implementation of 3D Gaussian splatting.
 
