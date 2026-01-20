@@ -7,8 +7,8 @@
 % input, generated in COLMAP format. Download example dataset from
 % <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
 datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 10000;
-numImages    = 10;
+numGaussians = 1000; % more gaussians creates sharper images, but needs more memory and has longer training time
+numImages    = 20;
 
 %% Define Learnable Parameters
 % Construct object and to load data and create learnable parameters
@@ -16,7 +16,7 @@ obj = GaussianSplatter(datasetPath, numGaussians, numImages);
 
 %% Specify Training Options
 % Train for 50 epochs with a mini-batch size of 1.
-miniBatchSize = 1;
+miniBatchSize = 2;
 numEpochs     = ceil(numGaussians/20);
 
 %%
@@ -138,15 +138,22 @@ if doTraining
 end
 
 %% Preview Results
+figure(2);
+numGenImages = 8;
 load("gaussians.mat");
-obj.camera = cell2struct(preview(obj.data.cameras),["id","width","height","fx","fy","cx","cy","Rcw","tcw","twc"],2);
-obj.initStorage(length(obj.camera));
-obj.createImage(params);
-renderedImg = extractdata(obj.image);
-if size(renderedImg,4) > 1
-    renderedImg = imtile(renderedImg);
+shuffle(mbq)
+for iteration = 1:ceil(numGenImages/miniBatchSize)
+    [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,...
+        obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,....
+        obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+    if (iteration == 1) && isempty(obj.image)
+        obj.initStorage(miniBatchSize);
+    end
+    obj.createImage(params);
+
+    genImages = cat(4,gather(extractdata(obj.image)),gather(extractdata(obj.image_gt)));
+    subplot(2,2,iteration);
+    imshow(imtile(genImages))
 end
-figure
-imshow(renderedImg)
-title("Generated Images")
+sgtitle("Generated Images")
 

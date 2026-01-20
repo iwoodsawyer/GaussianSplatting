@@ -6,10 +6,10 @@
 This HTML was auto-generated from MATLAB code.
 To make changes, update the MATLAB code and republish this document.
       -->
-<title>3D Visualization using Gaussian Splatting</title>
+<title>Train 3D Gaussian Splatting(3DGS)</title>
 <meta name="generator" content="MATLAB 25.2">
 <link rel="schema.DC" href="http://purl.org/dc/elements/1.1/">
-<meta name="DC.date" content="2026-01-15">
+<meta name="DC.date" content="2026-01-19">
 <meta name="DC.source" content="trainGaussianSplat.m">
 <style type="text/css">
 html,body,div,span,applet,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,a,abbr,acronym,address,big,cite,code,del,dfn,em,font,img,ins,kbd,q,s,samp,small,strike,strong,tt,var,b,u,i,center,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}body{line-height:1}ol,ul{list-style:none}blockquote,q{quotes:none}blockquote:before,blockquote:after,q:before,q:after{content:'';content:none}:focus{outine:0}ins{text-decoration:none}del{text-decoration:line-through}table{border-collapse:collapse;border-spacing:0}
@@ -76,7 +76,7 @@ table td { padding:7px 5px; text-align:left; vertical-align:top; border:1px soli
 </head>
 <body>
 <div class="content">
-<h1>Train 3D Gaussian Splatting (3DGS)</h1>
+<h1>Train 3D Gaussian Splatting(3DGS)</h1>
 <!--introduction-->
 <p>This example shows how-to train and generate 2D images using a minimal implementation of 3D Gaussian splatting.</p>
 <!--/introduction-->
@@ -103,8 +103,8 @@ table td { padding:7px 5px; text-align:left; vertical-align:top; border:1px soli
 <h2 id="1">Load Data</h2>
 <p>Specify the folder containing the SFM generated sparse 3d pointcloud as input, generated in COLMAP format. Download example dataset from <a href="https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip">https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip</a>.</p>
 <pre class="codeinput">datasetPath  = <span class="string">'C:\Source\tandt_db\tandt\train'</span>; <span class="comment">% Update this path</span>
-numGaussians = 2000;
-numImages    = 10;
+numGaussians = 1000; <span class="comment">% more gaussians creates sharper images, but needs more memory and has longer training time</span>
+numImages    = 20;
 </pre>
 <h2 id="2">Define Learnable Parameters</h2>
 <p>Construct object and to load data and create learnable parameters</p>
@@ -117,17 +117,16 @@ Loading 3D points...
 Loaded: 1 cameras, 301 images, 182686 points3D
 Processing metadata...
 Initializing Gaussians...
-scene scale: 0.780833
 </pre>
 <h2 id="3">Specify Training Options</h2>
 <p>Train for 50 epochs with a mini-batch size of 1.</p>
-<pre class="codeinput">miniBatchSize = 1;
+<pre class="codeinput">miniBatchSize = 2;
 numEpochs     = ceil(numGaussians/20);
 </pre>
 <p>Specify the options for Adam optimization:</p>
 <pre class="codeinput">learnRate     = 0.01;
 learnInterval = ceil(numEpochs/5);
-gradDecay     = 0.9;
+gradDecay     = 1 - miniBatchSize/numImages;
 sqGradDecay   = 0.999;
 </pre>
 <h2 id="5">Train Model</h2>
@@ -143,7 +142,7 @@ mbq = minibatchqueue(ds,<span class="string">'MiniBatchSize'</span>,miniBatchSiz
 </pre>
 <p>Adaptive densification</p>
 <pre class="codeinput">enableAdaptiveDensification = true;
-densifyInterval = ceil(numEpochs/10);
+densifyInterval = ceil(numEpochs/25);
 prunningRatio = 0.05;
 </pre>
 <p>Initialize the parameters for Adam optimization.</p>
@@ -160,6 +159,7 @@ numIterations = numEpochs * numIterationsPerEpoch;
     monitor = trainingProgressMonitor(<span class="string">'Metrics'</span>,<span class="string">"Loss"</span>,<span class="string">'Info'</span>,<span class="string">"Epoch"</span>,<span class="string">'XLabel'</span>,<span class="string">"Iteration"</span>);
 <span class="keyword">end</span>
 </pre>
+<img vspace="5" hspace="5" src="trainGaussianSplat_01.png" alt=""> <p>Initialize the preview render</p>
 <pre class="codeinput">imageIdxToShow = preview(obj.data.cameras);
 imageIdxToShow = imageIdxToShow{1};
 </pre>
@@ -226,30 +226,53 @@ imageIdxToShow = imageIdxToShow{1};
     obj.saveGaussians(<span class="string">"gaussians.mat"</span>);
 <span class="keyword">end</span>
 </pre>
-<pre class="codeoutput">Densification: 4 clones, 96 splits. 
-Densification: 17 clones, 82 splits. 
-Densification: 33 clones, 66 splits. 
-Densification: 32 clones, 54 splits. 
-Densification: 54 clones, 31 splits. 
-Densification: 36 clones, 39 splits. 
-Densification: 32 clones, 38 splits. 
-Densification: 31 clones, 31 splits. 
-Densification: 16 clones, 39 splits. 
+<pre class="codeoutput">More arrays to GPU environment...
+Densification: 50 clones, 0 splits. 
+Densification: 5 clones, 45 splits. 
+Densification: 5 clones, 45 splits. 
+Densification: 4 clones, 46 splits. 
+Densification: 15 clones, 33 splits. 
+Densification: 18 clones, 29 splits. 
+Densification: 24 clones, 20 splits. 
+Densification: 23 clones, 20 splits. 
+Densification: 22 clones, 20 splits. 
+Densification: 28 clones, 13 splits. 
+Densification: 23 clones, 13 splits. 
+Densification: 13 clones, 15 splits. 
+Densification: 13 clones, 12 splits. 
+Densification: 17 clones, 6 splits. 
+Densification: 17 clones, 8 splits. 
+Densification: 8 clones, 6 splits. 
+Densification: 16 clones, 13 splits. 
+Densification: 12 clones, 5 splits. 
+Densification: 19 clones, 5 splits. 
+Densification: 17 clones, 6 splits. 
+Densification: 17 clones, 5 splits. 
+Densification: 17 clones, 3 splits. 
+Densification: 14 clones, 4 splits. 
+Densification: 11 clones, 4 splits. 
 </pre>
-<img vspace="5" hspace="5" src="trainGaussianSplat_03.png" alt=""> <img vspace="5" hspace="5" src="trainGaussianSplat_04.png" alt=""> <h2 id="14">Preview Results</h2>
-<pre class="codeinput">load(<span class="string">"gaussians.mat"</span>);
-obj.camera = cell2struct(preview(obj.data.cameras),[<span class="string">"id"</span>,<span class="string">"width"</span>,<span class="string">"height"</span>,<span class="string">"fx"</span>,<span class="string">"fy"</span>,<span class="string">"cx"</span>,<span class="string">"cy"</span>,<span class="string">"Rcw"</span>,<span class="string">"tcw"</span>,<span class="string">"twc"</span>],2);
-obj.initStorage(length(obj.camera));
-obj.projectGaussiansWithCulling(params);
-renderedImg = extractdata(obj.image);
-<span class="keyword">if</span> size(renderedImg,4) &gt; 1
-    renderedImg = imtile(renderedImg);
+<img vspace="5" hspace="5" src="trainGaussianSplat_02.png" alt=""> <img vspace="5" hspace="5" src="trainGaussianSplat_03.png" alt=""> <h2 id="14">Preview Results</h2>
+<pre class="codeinput">figure(2);
+numGenImages = 8;
+load(<span class="string">"gaussians.mat"</span>);
+shuffle(mbq)
+<span class="keyword">for</span> iteration = 1:ceil(numGenImages/miniBatchSize)
+    [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,<span class="keyword">...</span>
+        obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,<span class="keyword">...</span><span class="comment">.</span>
+        obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+    <span class="keyword">if</span> (iteration == 1) &amp;&amp; isempty(obj.image)
+        obj.initStorage(miniBatchSize);
+    <span class="keyword">end</span>
+    obj.createImage(params);
+
+    genImages = cat(4,gather(extractdata(obj.image)),gather(extractdata(obj.image_gt)));
+    subplot(2,2,iteration);
+    imshow(imtile(genImages))
 <span class="keyword">end</span>
-figure
-imshow(renderedImg)
-title(<span class="string">"Generated Images"</span>)
+sgtitle(<span class="string">"Generated Images"</span>)
 </pre>
-<img vspace="5" hspace="5" src="trainGaussianSplat_05.png" alt=""> <p class="footer">
+<img vspace="5" hspace="5" src="trainGaussianSplat_04.png" alt=""> <p class="footer">
 <br>
 <a href="https://www.mathworks.com/products/matlab/">Published with MATLAB&reg; R2025b</a>
 <br>
@@ -257,7 +280,7 @@ title(<span class="string">"Generated Images"</span>)
 </div>
 <!--
 ##### SOURCE BEGIN #####
-%% Train 3D Gaussian Splatting (3DGS)
+%% Train 3D Gaussian Splatting(3DGS)
 % This example shows how-to train and generate 2D images using a 
 % minimal implementation of 3D Gaussian splatting.
 
@@ -266,8 +289,8 @@ title(<span class="string">"Generated Images"</span>)
 % input, generated in COLMAP format. Download example dataset from
 % <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
 datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 2000;
-numImages    = 10;
+numGaussians = 1000; % more gaussians creates sharper images, but needs more memory and has longer training time
+numImages    = 20;
 
 %% Define Learnable Parameters
 % Construct object and to load data and create learnable parameters
@@ -275,14 +298,14 @@ obj = GaussianSplatter(datasetPath, numGaussians, numImages);
 
 %% Specify Training Options
 % Train for 50 epochs with a mini-batch size of 1.
-miniBatchSize = 1;
+miniBatchSize = 2;
 numEpochs     = ceil(numGaussians/20);
 
 %%
 % Specify the options for Adam optimization:
 learnRate     = 0.01;
 learnInterval = ceil(numEpochs/5);
-gradDecay     = 0.9;
+gradDecay     = 1 - miniBatchSize/numImages;
 sqGradDecay   = 0.999;
 
 
@@ -307,7 +330,7 @@ mbq = minibatchqueue(ds,'MiniBatchSize',miniBatchSize, ...
 %%
 % Adaptive densification
 enableAdaptiveDensification = true;
-densifyInterval = ceil(numEpochs/10);
+densifyInterval = ceil(numEpochs/25);
 prunningRatio = 0.05;
 
 %%
@@ -397,17 +420,24 @@ if doTraining
 end
 
 %% Preview Results
+figure(2);
+numGenImages = 8;
 load("gaussians.mat");
-obj.camera = cell2struct(preview(obj.data.cameras),["id","width","height","fx","fy","cx","cy","Rcw","tcw","twc"],2);
-obj.initStorage(length(obj.camera));
-obj.projectGaussiansWithCulling(params);
-renderedImg = extractdata(obj.image);
-if size(renderedImg,4) > 1
-    renderedImg = imtile(renderedImg);
+shuffle(mbq)
+for iteration = 1:ceil(numGenImages/miniBatchSize)
+    [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,...
+        obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,....
+        obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+    if (iteration == 1) && isempty(obj.image)
+        obj.initStorage(miniBatchSize);
+    end
+    obj.createImage(params);
+
+    genImages = cat(4,gather(extractdata(obj.image)),gather(extractdata(obj.image_gt)));
+    subplot(2,2,iteration);
+    imshow(imtile(genImages))
 end
-figure
-imshow(renderedImg)
-title("Generated Images")
+sgtitle("Generated Images")
 
 
 ##### SOURCE END #####

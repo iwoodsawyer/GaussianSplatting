@@ -77,7 +77,6 @@ classdef ColmapData < handle
                 raw_h = info.Height;
                 
                 % Calculate Dimensions based on Downscale Factor
-                % C++: resize by 1.0 / kScaleDownFactor
                 w_cur = round(raw_w / obj.kScaleDownFactor);
                 h_cur = round(raw_h / obj.kScaleDownFactor);
                 
@@ -184,12 +183,10 @@ classdef ColmapData < handle
             g.pws = [[pts.x]', [pts.y]', [pts.z]'];
             
             % SH Colors
-            % rgb -> float[0,1] -> shift 0.5 -> div SH_C0_0
             rgb = [[pts.r]', [pts.g]', [pts.b]'];
             g.shs = ((double(rgb) / 255.0) - 0.5) / obj.SH_C0_0;
             
             % Rotation
-            % C++ sets {0, 0, 0, 1}
             g.rots = repmat([0, 0, 0, 1], num_pts, 1);
             
             % Alpha

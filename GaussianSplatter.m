@@ -7,6 +7,7 @@ classdef GaussianSplatter < handle
         windowSize = single(11);
 
         % Constants
+        SH_C0_0 = single(0.28209479177387814);
         C1 = single(0.01^2);
         C2 = single(0.03^2);
 
@@ -119,7 +120,6 @@ classdef GaussianSplatter < handle
             % Forward pass and loss calculation
 
             % Forward Pass
-            this.camera = structfun(@stripdims,this.camera,'UniformOutput',false);
             this.createImage(params);
 
             % L1 Loss
@@ -137,6 +137,9 @@ classdef GaussianSplatter < handle
 
         function createImage(this,params)
             % Create image uisng Gaussian Splatting
+
+            % Strip dimensions
+            this.camera = structfun(@stripdims,this.camera,'UniformOutput',false);
 
             % Reset image
             this.image(:) = 0;
@@ -229,9 +232,9 @@ classdef GaussianSplatter < handle
                 v(1:length(sortIdx),:,:,b) = gaussians(sortIdx,2,b);
                 alphas(1:length(sortIdx),:,:,b) = single(1.0)./(single(1.0) + exp(-params.alphas_raw(sortIdx)));
                 radius(1:length(sortIdx),:,:,b) = max(exp(params.scales_raw(sortIdx,:)),[],2).*inv_z(sortIdx,:,b).*this.camera.fx(b);
-                colors(1:length(sortIdx),:,1,b) = max(min(single(0.5) + single(0.28209479177387814).*params.shs(sortIdx,1),single(1.0)),single(0.0));
-                colors(1:length(sortIdx),:,2,b) = max(min(single(0.5) + single(0.28209479177387814).*params.shs(sortIdx,2),single(1.0)),single(0.0));
-                colors(1:length(sortIdx),:,3,b) = max(min(single(0.5) + single(0.28209479177387814).*params.shs(sortIdx,3),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,1,b) = max(min(single(0.5) + this.SH_C0_0.*params.shs(sortIdx,1),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,2,b) = max(min(single(0.5) + this.SH_C0_0.*params.shs(sortIdx,2),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,3,b) = max(min(single(0.5) + this.SH_C0_0.*params.shs(sortIdx,3),single(1.0)),single(0.0));
             end
         end
 
