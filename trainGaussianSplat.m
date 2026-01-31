@@ -7,7 +7,7 @@
 % input, generated in COLMAP format. Download example dataset from
 % <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
 datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 1000; % more gaussians creates sharper images, but needs more memory and has longer training time
+numGaussians = 2000; % more gaussians creates sharper images, but needs more memory and has longer training time
 numImages    = 20;
 
 %% Define Learnable Parameters
@@ -21,7 +21,7 @@ numEpochs     = ceil(numGaussians/20);
 
 %%
 % Specify the options for Adam optimization:
-learnRate     = 0.01;
+learnRate     = 0.02;
 learnInterval = ceil(numEpochs/5);
 gradDecay     = 1 - miniBatchSize/numImages;
 sqGradDecay   = 0.999;

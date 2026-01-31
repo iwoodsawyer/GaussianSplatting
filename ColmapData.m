@@ -193,7 +193,6 @@ classdef ColmapData < handle
             g.alphas = repmat(obj.kInitialAlpha, num_pts, 1);
             
             % Scales
-            % C++ uses nearest_dist placeholder = 0.1f
             nearest_dist = 0.1;
             g.scales = repmat([nearest_dist, nearest_dist, nearest_dist], num_pts, 1);
         end

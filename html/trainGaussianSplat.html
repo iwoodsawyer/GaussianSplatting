@@ -9,7 +9,7 @@ To make changes, update the MATLAB code and republish this document.
 <title>Train 3D Gaussian Splatting (3DGS)</title>
 <meta name="generator" content="MATLAB 25.2">
 <link rel="schema.DC" href="http://purl.org/dc/elements/1.1/">
-<meta name="DC.date" content="2026-01-19">
+<meta name="DC.date" content="2026-01-31">
 <meta name="DC.source" content="trainGaussianSplat.m">
 <style type="text/css">
 html,body,div,span,applet,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,a,abbr,acronym,address,big,cite,code,del,dfn,em,font,img,ins,kbd,q,s,samp,small,strike,strong,tt,var,b,u,i,center,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}body{line-height:1}ol,ul{list-style:none}blockquote,q{quotes:none}blockquote:before,blockquote:after,q:before,q:after{content:'';content:none}:focus{outine:0}ins{text-decoration:none}del{text-decoration:line-through}table{border-collapse:collapse;border-spacing:0}
@@ -103,7 +103,7 @@ table td { padding:7px 5px; text-align:left; vertical-align:top; border:1px soli
 <h2 id="1">Load Data</h2>
 <p>Specify the folder containing the SFM generated sparse 3d pointcloud as input, generated in COLMAP format. Download example dataset from <a href="https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip">https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip</a>.</p>
 <pre class="codeinput">datasetPath  = <span class="string">'C:\Source\tandt_db\tandt\train'</span>; <span class="comment">% Update this path</span>
-numGaussians = 1000; <span class="comment">% more gaussians creates sharper images, but needs more memory and has longer training time</span>
+numGaussians = 2000; <span class="comment">% more gaussians creates sharper images, but needs more memory and has longer training time</span>
 numImages    = 20;
 </pre>
 <h2 id="2">Define Learnable Parameters</h2>
@@ -124,7 +124,7 @@ Initializing Gaussians...
 numEpochs     = ceil(numGaussians/20);
 </pre>
 <p>Specify the options for Adam optimization:</p>
-<pre class="codeinput">learnRate     = 0.01;
+<pre class="codeinput">learnRate     = 0.02;
 learnInterval = ceil(numEpochs/5);
 gradDecay     = 1 - miniBatchSize/numImages;
 sqGradDecay   = 0.999;
@@ -226,31 +226,31 @@ imageIdxToShow = imageIdxToShow{1};
     obj.saveGaussians(<span class="string">"gaussians.mat"</span>);
 <span class="keyword">end</span>
 </pre>
-<pre class="codeoutput">More arrays to GPU environment...
-Densification: 50 clones, 0 splits. 
-Densification: 5 clones, 45 splits. 
-Densification: 5 clones, 45 splits. 
-Densification: 4 clones, 46 splits. 
-Densification: 15 clones, 33 splits. 
-Densification: 18 clones, 29 splits. 
-Densification: 24 clones, 20 splits. 
-Densification: 23 clones, 20 splits. 
-Densification: 22 clones, 20 splits. 
-Densification: 28 clones, 13 splits. 
-Densification: 23 clones, 13 splits. 
-Densification: 13 clones, 15 splits. 
-Densification: 13 clones, 12 splits. 
-Densification: 17 clones, 6 splits. 
-Densification: 17 clones, 8 splits. 
-Densification: 8 clones, 6 splits. 
-Densification: 16 clones, 13 splits. 
-Densification: 12 clones, 5 splits. 
-Densification: 19 clones, 5 splits. 
-Densification: 17 clones, 6 splits. 
-Densification: 17 clones, 5 splits. 
-Densification: 17 clones, 3 splits. 
-Densification: 14 clones, 4 splits. 
-Densification: 11 clones, 4 splits. 
+<pre class="codeoutput">Move arrays to GPU environment...
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
+Densification: 100 clones, 0 splits. 
 </pre>
 <img vspace="5" hspace="5" src="trainGaussianSplat_02.png" alt=""> <img vspace="5" hspace="5" src="trainGaussianSplat_03.png" alt=""> <h2 id="14">Preview Results</h2>
 <pre class="codeinput">figure(2);
@@ -289,7 +289,7 @@ sgtitle(<span class="string">"Generated Images"</span>)
 % input, generated in COLMAP format. Download example dataset from
 % <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
 datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 1000; % more gaussians creates sharper images, but needs more memory and has longer training time
+numGaussians = 2000; % more gaussians creates sharper images, but needs more memory and has longer training time
 numImages    = 20;
 
 %% Define Learnable Parameters
@@ -303,7 +303,7 @@ numEpochs     = ceil(numGaussians/20);
 
 %%
 % Specify the options for Adam optimization:
-learnRate     = 0.01;
+learnRate     = 0.02;
 learnInterval = ceil(numEpochs/5);
 gradDecay     = 1 - miniBatchSize/numImages;
 sqGradDecay   = 0.999;
