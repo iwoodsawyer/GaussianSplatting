@@ -263,7 +263,6 @@ classdef GaussianSplatter < handle
             v = dlarray(zeros(numValid,1,1,this.miniBatchSize,like=this.shToColor), 'SSCB');
             alphas = dlarray(zeros(numValid,1,1,this.miniBatchSize,like=this.shToColor), 'SSCB');
             Cov = dlarray(zeros(numValid,3,3,this.miniBatchSize,like=this.shToColor), 'SSSB');
-            %radius = dlarray(zeros(numValid,1,1,this.miniBatchSize,like=this.shToColor), 'SSCB');
             colors = dlarray(zeros(numValid,1,3,this.miniBatchSize,like=this.shToColor), 'SSCB');
             Sh = dlarray(zeros(numValid,length(this.shToColor),like=this.shToColor), 'SSC');
 
@@ -294,16 +293,13 @@ classdef GaussianSplatter < handle
                 Cov(1:numIdx,3,2,b) = single(2.0)*(quat(:,3).*quat(:,4) + quat(:,2).*quat(:,1));
                 Cov(1:numIdx,3,3,b) = single(1.0)-single(2.0)*(quat(:,2).*quat(:,2) + quat(:,3).*quat(:,3));
 
-                % Combine camera and Gaussian Rotations
+                % Combine camera and Gaussian rotations
                 Cov(:,:,:,b) = shiftdim(pagemtimes(this.camera.Rcw(:,:,b), shiftdim(stripdims(Cov(:,:,:,b)),1)),2);
 
-                % Apply scaling
-                Cov(1:numIdx,:,1,b) = Cov(1:numIdx,:,1,b).*exp(params.scales_raw(sortIdx,1)).*inv_z(sortIdx,:,b).*this.camera.fx(b);
-                Cov(1:numIdx,:,2,b) = Cov(1:numIdx,:,2,b).*exp(params.scales_raw(sortIdx,2)).*inv_z(sortIdx,:,b).*this.camera.fx(b);
-                Cov(1:numIdx,:,3,b) = Cov(1:numIdx,:,3,b).*exp(params.scales_raw(sortIdx,3)).*inv_z(sortIdx,:,b).*this.camera.fx(b);
-
-                % Map to screen space radius
-                %radius(1:numIdx,:,:,b) = reshape(pagenorm(extractdata(shiftdim(Rot(1:numIdx,:,:),1))),numIdx,1).*inv_z(sortIdx,:,b).*this.camera.fx(b);
+                % Apply scaling and map to screen space
+                Cov(1:numIdx,:,1,b) = Cov(1:numIdx,:,1,b).*exp(min(max(params.scales_raw(sortIdx,1),single(-10)),single(10))).*inv_z(sortIdx,:,b).*this.camera.fx(b);
+                Cov(1:numIdx,:,2,b) = Cov(1:numIdx,:,2,b).*exp(min(max(params.scales_raw(sortIdx,2),single(-10)),single(10))).*inv_z(sortIdx,:,b).*this.camera.fx(b);
+                Cov(1:numIdx,:,3,b) = Cov(1:numIdx,:,3,b).*exp(min(max(params.scales_raw(sortIdx,3),single(-10)),single(10))).*inv_z(sortIdx,:,b).*this.camera.fx(b);
 
                 % Normalize positions
                 pos = gaussians(sortIdx,:,b);
@@ -321,9 +317,9 @@ classdef GaussianSplatter < handle
                 Sh(1:numIdx,9) = this.shToColor(9).*( pos(:,1).*pos(:,1) - pos(:,2).*pos(:,2));
 
                 % Map to screen colors
-                colors(1:length(sortIdx),:,1,b) = max(min(single(0.5) + sum(Sh(1:numIdx,:).*params.shs(sortIdx,1),2),single(1.0)),single(0.0));
-                colors(1:length(sortIdx),:,2,b) = max(min(single(0.5) + sum(Sh(1:numIdx,:).*params.shs(sortIdx,2),2),single(1.0)),single(0.0));
-                colors(1:length(sortIdx),:,3,b) = max(min(single(0.5) + sum(Sh(1:numIdx,:).*params.shs(sortIdx,3),2),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,1,b) = max(min(single(0.5) + sum(Sh(1:numIdx,:).*params.shs(sortIdx,:,1),2),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,2,b) = max(min(single(0.5) + sum(Sh(1:numIdx,:).*params.shs(sortIdx,:,2),2),single(1.0)),single(0.0));
+                colors(1:length(sortIdx),:,3,b) = max(min(single(0.5) + sum(Sh(1:numIdx,:).*params.shs(sortIdx,:,3),2),single(1.0)),single(0.0));
             end
         end
 
@@ -337,7 +333,7 @@ classdef GaussianSplatter < handle
             [~,pruneIdx] = sort(this.params.alphas_raw.*abs(avgGrad.alphas_raw));
 
             % Force prunning of gaussians with opacity below threshold
-            shouldPrune = this.params.alphas_raw(pruneIdx) < this.forcePruneThreshold;
+            shouldPrune = (this.params.alphas_raw(pruneIdx) < this.forcePruneThreshold);
 
             % Select gaussians with lowest contribution for prunning
             shouldPrune(1:ceil(prunningRatio*this.numGaussians)) = true;
@@ -464,15 +460,28 @@ classdef GaussianSplatter < handle
             function [A, V] = jacobi_step(A, V, p, q)
                 % Extracts columns p and q
                 Ap = A(:,p,:);
-                Aq = A(:,q, :);
+                Aq = A(:,q,:);
 
-                % Compute elements of the 2x2 Gram matrix A(:, [p q])' * A(:, [p q])
+                % Compute elements of the 2x2 Gram matrix
                 a = sum(Ap.*Ap, 1);
                 b = sum(Aq.*Aq, 1);
                 d = sum(Ap.*Aq, 1);
 
+                % Calculate rotation angle safely.
+                numer = single(2.0)*d;
+                denom = a-b;
+                
+                % Mask is 0 if isotropic (risky), 1 otherwise
+                is_safe = (abs(numer) > single(1e-6)) | (abs(denom) > single(1e-6));
+                
+                % If unsafe, replace inputs with dummy values to get valid
+                % atan2 gradient, then zero out the angle using the mask.
+                safe_numer = numer + single(~is_safe);
+                safe_denom = denom + single(~is_safe);
+
                 % Calculate rotation angle to annihilate d
-                theta = single(0.5).*atan2(single(2.0)*d,a-b);
+                theta = single(0.5).*atan2(safe_numer, safe_denom);
+                theta = theta.*single(is_safe); 
                 c = cos(theta);
                 s = sin(theta);
 
@@ -481,22 +490,16 @@ classdef GaussianSplatter < handle
                 s = reshape(s, 1, 1, []);
 
                 % Apply rotation to A (columns)
-                Ap_new =  c.*Ap + s.*Aq;
-                Aq_new = -s.*Ap + c.*Aq;
-
-                A(:,p,:) = Ap_new;
-                A(:,q,:) = Aq_new;
+                A(:,p,:) =  c.*Ap + s.*Aq;
+                A(:,q,:) = -s.*Ap + c.*Aq;
 
                 % Apply rotation to V (columns)
                 % Accumulate the rotations
                 Vp = V(:,p,:);
                 Vq = V(:,q,:);
 
-                Vp_new =  c.*Vp + s.*Vq;
-                Vq_new = -s.*Vp + c.*Vq;
-
-                V(:,p,:) = Vp_new;
-                V(:,q,:) = Vq_new;
+                V(:,p,:) =  c.*Vp + s.*Vq;
+                V(:,q,:) = -s.*Vp + c.*Vq;
             end
         end
     end
