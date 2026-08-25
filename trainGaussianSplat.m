@@ -8,14 +8,16 @@
 %   - 2560 CUDA cores (Ada Lovelace)
 %
 % Blocked Image Pipeline:
-%   - Ground-truth images are loaded as blockedImage objects using the
-%     Image Processing Toolbox, decomposed into 256x256 tiles.
-%   - A two-level multi-resolution pyramid is built with makeMultiLevel2D.
-%     Training starts at half-resolution (Level 2) for fast early convergence,
-%     then switches to full resolution (Level 1) at 30% of total epochs.
-%   - blockedImageDatastore streams tiles directly to the GPU via
-%     minibatchqueue with OutputEnvironment='gpu', eliminating full-image
-%     CPU-to-GPU transfers.
+%   Ground-truth images are loaded as blockedImage objects using the
+%   Image Processing Toolbox, decomposed into 256x256 tiles.
+%   Two single-level blockedImageDatastores are pre-built:
+%     imagesHalf : half-resolution for fast early-epoch convergence
+%     imagesFull : full resolution for fine-detail refinement
+%   Training starts at half-resolution and switches at levelSwitchEpoch.
+%   blockedImageDatastore.read() returns cell arrays; a transform()
+%   unwraps each cell to a plain H×W×C single array before combine().
+%   minibatchqueue with OutputEnvironment='gpu' transfers tiles
+%   directly to GPU VRAM, eliminating CPU staging copies.
 
 %% Load Data
 % Specify the folder containing the SFM generated sparse 3D point cloud as
@@ -28,10 +30,7 @@ numImages    = 20;
 
 %% Blocked Image Settings
 % Tile size for blockedImage decomposition.
-% 256x256 is optimal for the RTX 4050 Laptop (6 GB VRAM, 2560 CUDA cores):
-%   - Fits multiple tiles per GPU warp efficiently.
-%   - Keeps per-iteration VRAM footprint well under the 6 GB ceiling.
-%   - Aligns with CUDA memory transaction width for Ada Lovelace.
+% 256x256 is optimal for the RTX 4050 Laptop (6 GB VRAM, 2560 CUDA cores).
 blockSize = [256, 256];
 
 %% Define Learnable Parameters
@@ -42,45 +41,42 @@ obj = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize);
 
 %% Specify Training Options
 % Train for numEpochs epochs with a mini-batch size of 2.
-% miniBatchSize=2 keeps VRAM usage balanced on the RTX 4050 6 GB budget:
-% each 256x256x3 single-precision tile pair occupies ~1.5 MB, leaving
-% headroom for learnable parameters and gradient buffers.
+% miniBatchSize=2 keeps VRAM usage balanced on the RTX 4050 6 GB budget.
 miniBatchSize = 2;
 numEpochs     = ceil(numGaussians / 20);
 
-% Specify the options for Adam optimization.
+% Adam optimization options
 learnRate     = 0.02;
 learnInterval = ceil(numEpochs / 5);
 gradDecay     = 1 - miniBatchSize / numImages;
 sqGradDecay   = 0.999;
 
 %% Multi-Resolution Schedule
-% Switch from half-resolution (Level 2) to full resolution (Level 1) at
-% 30% through training. Early epochs converge faster at lower resolution;
-% later epochs refine fine details at full resolution.
+% Switch from half-resolution to full resolution at 30% of total epochs.
+% Early epochs converge faster at lower resolution; later epochs refine
+% fine details at full resolution.
 levelSwitchEpoch = max(1, floor(numEpochs * 0.3));
 
 %% Train Model
-% Train the 3D Gaussian splat model using a custom training loop.
-%
-% Training is computationally expensive and can take hours. To save time
-% while running this example, load a pretrained network by setting
-% doTraining to false. To train the network yourself, set doTraining to true.
+% To save time, load a pretrained network by setting doTraining to false.
+% To train the network yourself, set doTraining to true.
 doTraining = true;
 
 %% Create minibatchqueue
-% Create a minibatchqueue that processes and manages mini-batches of image
-% tiles and camera data during training.
+% Combine the image tile datastore with the camera label datastores.
+% blockedImageDatastore.read() returns a cell array of blocks.
+% ColmapData.unwrapBlockCell (applied via transform in ColmapData) converts
+% each cell to a plain H×W×C single array so combine/horzcat succeeds.
 %
-% The combined datastore merges the blockedImageDatastore (image tiles) with
-% the camera label arrayDatastores. OutputEnvironment='gpu' transfers each
-% block directly to GPU memory, bypassing a redundant CPU staging copy.
+% OutputEnvironment='gpu' transfers each block directly to GPU VRAM,
+% bypassing a redundant CPU staging copy on the RTX 4050.
 ds = combine(obj.data.images, obj.data.cameras);
+
 mbq = minibatchqueue(ds, ...
     'MiniBatchSize',    miniBatchSize, ...
     'PartialMiniBatch', 'discard', ...
     'OutputEnvironment','gpu', ...
-    'MiniBatchFormat',  ["SSCB","B","B","B","B","B","B","B","SSB","SB","SB"]);
+    'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
 
 %% Adaptive Densification Settings
 enableAdaptiveDensification = true;
@@ -107,9 +103,6 @@ imageIdxToShow = preview(obj.data.cameras);
 imageIdxToShow = imageIdxToShow{1};
 
 %% Custom Training Loop
-% For each epoch, shuffle the image tiles and camera data and loop over
-% mini-batches. Adaptive densification prunes low-contribution Gaussians
-% and clones/splits high-gradient ones at regular intervals.
 if doTraining
     iteration = 0;
     epoch     = 0;
@@ -119,11 +112,19 @@ if doTraining
 
         % -----------------------------------------------------------------
         % Multi-resolution schedule: switch to full-resolution at the
-        % configured epoch threshold.
+        % configured epoch threshold. setLevel() swaps obj.data.images
+        % from imagesHalf to imagesFull without reloading any data.
         % -----------------------------------------------------------------
         if epoch == levelSwitchEpoch
-            obj.data.images.Level = 1;  % Level 1 = finest resolution
-            fprintf('Switched blockedImageDatastore to full resolution at epoch %d.\n', epoch);
+            obj.data.setLevel(1);
+            % Rebuild combined datastore and minibatchqueue at new resolution
+            ds  = combine(obj.data.images, obj.data.cameras);
+            mbq = minibatchqueue(ds, ...
+                'MiniBatchSize',    miniBatchSize, ...
+                'PartialMiniBatch', 'discard', ...
+                'OutputEnvironment','gpu', ...
+                'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
+            fprintf('Switched to full-resolution training at epoch %d.\n', epoch);
         end
 
         % Shuffle data at the start of each epoch
@@ -134,13 +135,21 @@ if doTraining
 
             % Fetch next mini-batch of image tiles and camera parameters.
             % Data arrives on GPU due to OutputEnvironment='gpu'.
-            [obj.image_gt, obj.camera.id, obj.camera.width, obj.camera.height, ...
-             obj.camera.fx, obj.camera.fy, obj.camera.cx, obj.camera.cy, ...
+            % Camera scalars come as 'CB' format — squeeze removes the
+            % leading channel dimension to give plain 1×B vectors.
+            [obj.image_gt, camId, camW, camH, camFx, camFy, camCx, camCy, ...
              obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(mbq);
 
+            obj.camera.id     = squeeze(camId);
+            obj.camera.width  = squeeze(camW);
+            obj.camera.height = squeeze(camH);
+            obj.camera.fx     = squeeze(camFx);
+            obj.camera.fy     = squeeze(camFy);
+            obj.camera.cx     = squeeze(camCx);
+            obj.camera.cy     = squeeze(camCy);
+
             if iteration == 1
-                % Initialize GPU storage on first iteration, once data
-                % dimensions are known from the first mini-batch.
+                % Initialize GPU storage once on the first iteration
                 obj.initStorage(miniBatchSize);
             end
 
@@ -198,9 +207,16 @@ load("gaussians.mat");
 shuffle(mbq);
 
 for iteration = 1:ceil(numGenImages / miniBatchSize)
-    [obj.image_gt, obj.camera.id, obj.camera.width, obj.camera.height, ...
-     obj.camera.fx, obj.camera.fy, obj.camera.cx, obj.camera.cy, ...
+    [obj.image_gt, camId, camW, camH, camFx, camFy, camCx, camCy, ...
      obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(mbq);
+
+    obj.camera.id     = squeeze(camId);
+    obj.camera.width  = squeeze(camW);
+    obj.camera.height = squeeze(camH);
+    obj.camera.fx     = squeeze(camFx);
+    obj.camera.fy     = squeeze(camFy);
+    obj.camera.cx     = squeeze(camCx);
+    obj.camera.cy     = squeeze(camCy);
 
     if iteration == 1 && isempty(obj.image)
         obj.initStorage(miniBatchSize);
