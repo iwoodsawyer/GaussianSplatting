@@ -60,7 +60,7 @@ classdef GaussianSplatter < handle
     %   - Fused GPU operations: reduce intermediate allocations
     %   - Persistent buffers: reuse arrays across iterations (no per-batch malloc)
     %   - Separable operations: 1-D coordinates and SSIM convolutions
-    %   - Numerically stable: clamped alpha compositing
+    %   - Numerically stable: chunked, vectorized alpha compositing
     %   - Clean code: explicit meshgrid for 2-D expansion (no confusing reshapes)
 
     properties
@@ -601,6 +601,14 @@ classdef GaussianSplatter < handle
                             accB = accB + sum(w .* cB, 3);
 
                             T_tile = T_tile .* Tk(:, :, end);
+
+                            % Per-chunk early termination: one small sync per
+                            % chunk (amortized over chunkSize Gaussians);
+                            % skipped on the final chunk where it's useless.
+                            if c0 + K <= numG && ...
+                                    gather(max(T_tile, [], 'all')) < single(0.01)
+                                break;
+                            end
                         end
 
                         % Single write per tile (tiles are disjoint, image pre-zeroed)
