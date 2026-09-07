@@ -12,15 +12,25 @@
 %   read() returns one fixed-size block (blockSize + 2*overlap), not a full
 %   image. Camera info is repeated once per block with cx/cy shifted to the
 %   block's local origin, so combine(obj.data.images, obj.data.cameras)
-%   still gives strict 1-to-1 correspondence.
+%   still gives strict 1-to-1 correspondence. blockSize defaults to
+%   GaussianSplatter.autoSelectBlockSize(), which picks the size (per
+%   dimension, in [64, 160]) that minimizes total partial-block zero-padding
+%   summed over both resolution levels.
 %
-% Tile-Aware GPU Rasterization:
-%   blockSize drives both the dataset's block grid (ColmapData) and
-%   GaussianSplatter.createImage()'s internal tile-culling loop. Because
-%   the L1/SSIM loss is computed directly on this.image/this.image_gt
-%   (now block-sized), the loss is automatically scoped to the block
-%   instead of the full image — increasing miniBatchSize below now simply
-%   increases the number of blocks processed per training step.
+% GPU-Vectorized Rendering:
+%   Rasterization no longer loops per-Gaussian or per-batch-element:
+%     - projectGaussiansWithCulling processes all Gaussians x all blocks in
+%       the batch as [N x B] arrays in one pass (camera transform,
+%       projection, Sigma_2D via an elementwise J*Sigma*J^T, depth sort),
+%       scattering results into persistent buffers by pure indexing.
+%     - rasterizeToGPU composites depth-sorted Gaussians in vectorized
+%       chunks per tile (fused [H' x W' x K] alpha maps, cumprod
+%       transmittance, one image write per tile), with a per-chunk
+%       (not per-Gaussian) early-termination check once a tile saturates.
+%   Because the L1/SSIM loss is computed directly on this.image/this.image_gt
+%   (now block-sized), the loss is automatically scoped to the block instead
+%   of the full image — increasing miniBatchSize below now simply increases
+%   the number of blocks processed per training step.
 %
 % Multi-Resolution Schedule:
 %   Training starts at half resolution (fast early convergence).
@@ -45,28 +55,10 @@ numImages    = 20;
 % it does NOT change the block grid, so it has no effect on padding —
 % only blockSize does.
 %
-% Auto-select the block size (per dimension, within [64, 160]) that
-% minimizes total partial-block zero-padding summed over both resolution
-% levels. Canvas sizes follow imresize: full = ceil(raw/2), half = ceil(raw/4).
-imds     = imageDatastore(fullfile(datasetPath, 'images'));
-info     = imfinfo(imds.Files{1});
-fullHW   = ceil([info.Height, info.Width] / 2);
-halfHW   = ceil([info.Height, info.Width] / 4);
-
-blockSize = zeros(1, 2);
-for d = 1:2
-    bestPad = inf;
-    for b = 64:160
-        pad = (ceil(fullHW(d)/b)*b - fullHW(d)) + (ceil(halfHW(d)/b)*b - halfHW(d));
-        if pad <= bestPad   % <= prefers larger blocks (less per-block overhead)
-            bestPad = pad;
-            blockSize(d) = b;
-        end
-    end
-end
-fprintf('Auto block size: [%d %d] (full canvas %dx%d, half %dx%d)\n', ...
-    blockSize(1), blockSize(2), fullHW(1), fullHW(2), halfHW(1), halfHW(2));
-
+% Leaving blockSize empty lets GaussianSplatter.autoSelectBlockSize() pick
+% the size (per dimension, in [64, 160]) that minimizes total partial-block
+% zero-padding summed over both resolution levels.
+blockSize   = [];
 overlapSize = [8, 8];
 
 %% Define Learnable Parameters
@@ -116,7 +108,7 @@ ds = combine(obj.data.images, obj.data.cameras);
 mbq = minibatchqueue(ds, ...
     'MiniBatchSize',    miniBatchSize, ...
     'PartialMiniBatch', 'discard', ...
-    'OutputEnvironment','gpu', ...
+    'OutputEnvironment',GaussianSplatter.outEnv(obj.useGPU), ...
     'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
 
 %% Adaptive Densification Settings
@@ -171,7 +163,7 @@ if doTraining
             mbq = minibatchqueue(ds, ...
                 'MiniBatchSize',    miniBatchSize, ...
                 'PartialMiniBatch', 'discard', ...
-                'OutputEnvironment','gpu', ...
+                'OutputEnvironment',GaussianSplatter.outEnv(obj.useGPU), ...
                 'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
             totalNumBlocks        = obj.data.images.TotalNumBlocks;
             gradDecay             = 1 - miniBatchSize / totalNumBlocks;
@@ -268,79 +260,6 @@ end
 % blocks, comparing prediction vs ground truth — rather than showing
 % individual (scrambled, out-of-order) blocks.
 figure(2);
-numGenImages = 4;
+numGenImages = 8;
 load("gaussians.mat");
-
-blockH = obj.data.blockSize(1);
-blockW = obj.data.blockSize(2);
-padH   = obj.data.overlap(1);
-padW   = obj.data.overlap(2);
-coreRows = (padH+1):(padH+blockH);
-coreCols = (padW+1):(padW+blockW);
-
-% Cheap metadata-only pass (no pixel decode) to group blocks by source image.
-camRows = readall(obj.data.cameras);
-allIds  = cell2mat(camRows(:, 1));
-uniqueIds = unique(allIds, 'stable');
-numShow   = min(numGenImages, numel(uniqueIds));
-
-previewFormat = ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"];
-
-for n = 1:numShow
-    % All blocks belonging to this source image (blockId doubles as the
-    % 1-based read-order index, so it can be used directly with subset()).
-    blockIdx = find(allIds == uniqueIds(n));
-    numBlocksForImage = numel(blockIdx);
-
-    subDs  = subset(combine(obj.data.images, obj.data.cameras), blockIdx);
-    subMbq = minibatchqueue(subDs, ...
-        'MiniBatchSize',    numBlocksForImage, ...
-        'OutputEnvironment','gpu', ...
-        'MiniBatchFormat',  previewFormat);
-
-    [obj.image_gt, ~, ~, camBlockRow, camBlockCol, camW, camH, camFx, camFy, camCx, camCy, ...
-     obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(subMbq);
-
-    obj.camera.width  = squeeze(camW);
-    obj.camera.height = squeeze(camH);
-    obj.camera.fx     = squeeze(camFx);
-    obj.camera.fy     = squeeze(camFy);
-    obj.camera.cx     = squeeze(camCx);
-    obj.camera.cy     = squeeze(camCy);
-
-    obj.initStorage(numBlocksForImage);
-    obj.createImage(params);
-
-    blockRows = round(gather(extractdata(squeeze(camBlockRow))));
-    blockCols = round(gather(extractdata(squeeze(camBlockCol))));
-    numBlockRows = max(blockRows);
-    numBlockCols = max(blockCols);
-
-    predBlocks = gather(extractdata(obj.image));
-    gtBlocks   = gather(extractdata(obj.image_gt));
-
-    % Stitch blocks into full mosaics, cropping away each block's halo
-    % (overlap) so only its core blockSize region is placed in the canvas.
-    predFull = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
-    gtFull   = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
-
-    for b = 1:numBlocksForImage
-        rowStart = (blockRows(b)-1)*blockH + 1;
-        colStart = (blockCols(b)-1)*blockW + 1;
-        predFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
-            predBlocks(coreRows, coreCols, :, b);
-        gtFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
-            gtBlocks(coreRows, coreCols, :, b);
-    end
-
-    % Crop away PadPartialBlocks zero-padding beyond the true image extent
-    imgNum = obj.data.images.BlockLocationSet.ImageNumber(blockIdx(1));
-    imgSz  = obj.data.images.Images(imgNum).Size;
-    predFull = predFull(1:min(end, imgSz(1)), 1:min(end, imgSz(2)), :);
-    gtFull   = gtFull(1:min(end, imgSz(1)),   1:min(end, imgSz(2)), :);
-
-    subplot(2, ceil(numShow/2), n);
-    imshow(imtile(cat(4, predFull, gtFull)));
-    title(sprintf('Image id %d', uniqueIds(n)));
-end
-sgtitle("Generated Images (Prediction | Ground Truth)");
+obj.previewResults(params, numGenImages);

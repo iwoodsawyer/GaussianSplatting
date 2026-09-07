@@ -50,18 +50,23 @@ classdef GaussianSplatter < handle
     %
     % GPU Memory Strategy:
     %   initStorage() unconditionally allocates all working arrays on GPU.
-    %   Projection buffers are allocated ONCE and reused across all iterations,
-    %   eliminating fragmentation and per-batch sync/allocation overhead.
-    %   minibatchqueue delivers data with OutputEnvironment='gpu', so GPU
-    %   residency is guaranteed from the first iteration onwards.
+    %   Projection buffers are allocated ONCE and fully overwritten each
+    %   batch (no zeroing pass needed), eliminating fragmentation and
+    %   per-batch allocation overhead. minibatchqueue delivers data with
+    %   OutputEnvironment='gpu', so GPU residency is guaranteed from the
+    %   first iteration onwards.
     %
     % GPU Optimization Strategy:
-    %   - Minimal extractdata() calls: only one per-batch call for CPU culling
-    %   - Fused GPU operations: reduce intermediate allocations
-    %   - Persistent buffers: reuse arrays across iterations (no per-batch malloc)
+    %   - Projection fully vectorized across the batch: [N x B] arrays,
+    %     elementwise J*Sigma*J^T, one column-wise depth sort, buffers
+    %     filled by pure indexing (no per-batch-element compute loop)
+    %   - Rasterization in depth-sorted chunks of chunkSize: fused
+    %     [H' x W' x K] alpha maps, cumprod transmittance, tile-local
+    %     accumulation with a single image write per tile
+    %   - Minimal GPU→CPU syncs: culling/sort inputs, tile-list bboxes,
+    %     and one amortized early-termination check per chunk
+    %   - Persistent buffers: reused across iterations (no per-batch malloc)
     %   - Separable operations: 1-D coordinates and SSIM convolutions
-    %   - Numerically stable: chunked, vectorized alpha compositing
-    %   - Clean code: explicit meshgrid for 2-D expansion (no confusing reshapes)
 
     properties
         % --- Sizes ---
@@ -73,16 +78,10 @@ classdef GaussianSplatter < handle
         imageChannel
 
         % --- Tile Settings ---
-        % Tile dimensions for the rasterizer canvas partitioning.
-        % Independent of the image datastore — full images are loaded per
-        % iteration and partitioned into tiles inside createImage.
-        % 
-        % TUNING GUIDE (hardware and dataset dependent):
-        %   64×64:   RTX 4050/4060 (6GB), small scenes (<5k Gaussians)
-        %            Better work distribution, higher CPU loop overhead
-        %   128×128: RTX 3070+ (8-10GB), medium scenes
-        %   256×256: RTX 3080+ (10GB+), large scenes (>50k Gaussians)
-        %            Fewer tiles, less CPU overhead, early termination less effective
+        % Block/tile dimensions shared by the dataset's blockedImage grid
+        % (ColmapData) and the rasterizer canvas partitioning — each read()
+        % delivers one block of blockSize + 2*overlap, so the canvas is
+        % usually a single tile.
         %
         % Default: auto-selected based on GPU compute capability.
         blockSize = [];  % Will be auto-selected in constructor if not provided
@@ -94,6 +93,12 @@ classdef GaussianSplatter < handle
         % --- Data ---
         datasetPath
         data
+
+        % --- Device ---
+        % Auto-detected once in the constructor; drives OutputEnvironment for
+        % every minibatchqueue. All GPU/CPU buffer allocation elsewhere just
+        % follows the device residency of the data delivered by those queues.
+        useGPU
 
         % --- Learnable Parameters ---
         params
@@ -135,9 +140,9 @@ classdef GaussianSplatter < handle
         T         % Per-pixel transmittance  [H x W x 1] plain gpuArray
 
         % --- Persistent Projection Buffers (reused every batch, allocated once) ---
-        % These are allocated in initStorage() and never deallocated.
-        % On every call to projectGaussiansWithCulling(), buffers are zeroed
-        % and filled, then passed to createImage(). This eliminates per-batch
+        % Allocated in initStorage() and never deallocated. Every call to
+        % projectGaussiansWithCulling() fully overwrites them with depth-sorted
+        % values (invalid slots marked by radius -1). This eliminates per-batch
         % GPU memory allocation and fragmentation.
         u_buffer           % [numGaussians x 1 x 1 x B] dlarray 'SSCB'
         v_buffer           % [numGaussians x 1 x 1 x B] dlarray 'SSCB'
@@ -182,24 +187,13 @@ classdef GaussianSplatter < handle
             %                          Defaults to [0 0].
             %
             % BLOCKSIZE AUTO-SELECTION:
-            %   If blockSize is empty or not provided, tile size is automatically
-            %   selected based on GPU compute capability:
-            %     CC >= 8.0 (RTX 30+): 128×128
-            %     CC >= 7.0 (RTX 20+):  96×96
-            %     CC < 7.0  (Older):   256×256
+            %   If blockSize is empty or not provided, autoSelectBlockSize()
+            %   picks the size (searched per dimension in [64, 160]) that
+            %   minimizes total blockedImageDatastore zero-padding summed
+            %   over both the Half and Full resolution levels.
 
             if nargin < 4 || isempty(blockSize)
-                % Auto-select tile size based on GPU capability
-                g = gpuDevice;
-                if g.ComputeCapability >= 8.0  % RTX 30 series and newer
-                    blockSize = [128, 128];
-                elseif g.ComputeCapability >= 7.0  % RTX 20 series
-                    blockSize = [96, 96];
-                else  % Older GPUs
-                    blockSize = [256, 256];
-                end
-                fprintf('Auto-selected tile size: %d×%d (GPU CC %.1f)\n', ...
-                    blockSize(1), blockSize(2), g.ComputeCapability);
+                blockSize = GaussianSplatter.autoSelectBlockSize(datasetPath);
             end
             if nargin < 5 || isempty(overlap)
                 overlap = [0, 0];
@@ -207,6 +201,18 @@ classdef GaussianSplatter < handle
 
             this.camera    = struct;
             this.blockSize = blockSize;
+
+            % Falls back to false if no usable GPU or Parallel Computing Toolbox
+            try
+                this.useGPU = canUseGPU();
+            catch
+                this.useGPU = false;
+            end
+            if this.useGPU
+                fprintf('GaussianSplatter running in GPU mode.\n');
+            else
+                fprintf('GaussianSplatter running in CPU mode.\n');
+            end
 
             % Store sizes
             this.datasetPath  = datasetPath;
@@ -281,11 +287,16 @@ classdef GaussianSplatter < handle
             % currently active datastore resolution before this is called.
             this.miniBatchSize = miniBatchSize;
 
-            % Rendered image buffer — lives on GPU for the full training run.
-            % Sized to the current block canvas (blockSize + 2*overlap).
+            % Reference array already resident on the right device (GPU or
+            % CPU) — this.image_gt was produced by a minibatchqueue configured
+            % with this.useGPU, so every 'like' allocation below just follows it.
+            refArr = extractdata(this.image_gt);
+
+            % Rendered image buffer, sized to the current block canvas
+            % (blockSize + 2*overlap).
             this.image = dlarray( ...
-                gpuArray(zeros(this.imageHeight, this.imageWidth, 3, ...
-                               this.miniBatchSize, 'single')), 'SSCB');
+                zeros(this.imageHeight, this.imageWidth, 3, ...
+                      this.miniBatchSize, 'like', refArr), 'SSCB');
 
             % Pixel coordinate vectors (separable) — saves ~8 MB vs. dense
             % meshgrid. Span the current block canvas so
@@ -294,56 +305,57 @@ classdef GaussianSplatter < handle
             % 
             % Instead of [H×W×1] grids, use [1×W] and [H×1] vectors with
             % implicit broadcasting during Mahalanobis computation.
-            this.X_vec = gpuArray(single(1:this.imageWidth));     % [1 x W]
-            this.Y_vec = gpuArray(single((1:this.imageHeight)')); % [H x 1]
+            this.X_vec = cast(single(1:this.imageWidth), 'like', refArr);     % [1 x W]
+            this.Y_vec = cast(single((1:this.imageHeight)'), 'like', refArr); % [H x 1]
 
             % Per-pixel transmittance accumulator — reset to 1 per batch
-            % Use plain gpuArray (not dlarray) since T is not differentiated
-            this.T = gpuArray(ones(this.imageHeight, this.imageWidth, 1, 'single'));
+            % Plain array (not dlarray) since T is not differentiated
+            this.T = ones(this.imageHeight, this.imageWidth, 1, 'like', refArr);
 
-            % SSIM loss constants on GPU (plain gpuArray, not dlarray)
-            this.C1 = gpuArray(this.C1);
-            this.C2 = gpuArray(this.C2);
+            % SSIM loss constants (plain array, not dlarray)
+            this.C1 = cast(this.C1, 'like', refArr);
+            this.C2 = cast(this.C2, 'like', refArr);
 
-            % Combined loss weight on GPU
-            this.lambda = gpuArray(this.lambda);
+            % Combined loss weight
+            this.lambda = cast(this.lambda, 'like', refArr);
 
-            % Separable SSIM Gaussian kernels on GPU (plain gpuArray)
-            this.window_h = gpuArray(this.window_h);
-            this.window_v = gpuArray(this.window_v);
+            % Separable SSIM Gaussian kernels (plain array)
+            this.window_h = cast(this.window_h, 'like', refArr);
+            this.window_v = cast(this.window_v, 'like', refArr);
 
             % --- Allocate Persistent Projection Buffers ---
-            % These are allocated once and reused across all training iterations.
-            % On each call to projectGaussiansWithCulling(), buffers are zeroed
-            % and refilled. This avoids per-batch GPU allocation, which can cause
-            % fragmentation and GPU→CPU sync overhead.
+            % Allocated once and fully overwritten by every call to
+            % projectGaussiansWithCulling(). This avoids per-batch GPU
+            % allocation, which can cause fragmentation and sync overhead.
             fprintf('Allocating persistent projection buffers (%d Gaussians)...\n', ...
                 this.numGaussians);
 
-            this.u_buffer = dlarray(gpuArray(zeros(this.numGaussians, 1, 1, ...
-                miniBatchSize, 'single')), 'SSCB');
-            this.v_buffer = dlarray(gpuArray(zeros(this.numGaussians, 1, 1, ...
-                miniBatchSize, 'single')), 'SSCB');
-            this.alphas_buffer = dlarray(gpuArray(zeros(this.numGaussians, 1, 1, ...
-                miniBatchSize, 'single')), 'SSCB');
-            this.Sigma2D_inv_buffer = dlarray(gpuArray(zeros(this.numGaussians, 2, 2, ...
-                miniBatchSize, 'single')), 'SSSB');
-            this.radii_u_buffer = gpuArray(zeros(this.numGaussians, 1, ...
-                miniBatchSize, 'single'));
-            this.radii_v_buffer = gpuArray(zeros(this.numGaussians, 1, ...
-                miniBatchSize, 'single'));
-            this.colors_buffer = dlarray(gpuArray(zeros(this.numGaussians, 1, 3, ...
-                miniBatchSize, 'single')), 'SSCB');
+            this.u_buffer = dlarray(zeros(this.numGaussians, 1, 1, ...
+                miniBatchSize, 'like', refArr), 'SSCB');
+            this.v_buffer = dlarray(zeros(this.numGaussians, 1, 1, ...
+                miniBatchSize, 'like', refArr), 'SSCB');
+            this.alphas_buffer = dlarray(zeros(this.numGaussians, 1, 1, ...
+                miniBatchSize, 'like', refArr), 'SSCB');
+            this.Sigma2D_inv_buffer = dlarray(zeros(this.numGaussians, 2, 2, ...
+                miniBatchSize, 'like', refArr), 'SSSB');
+            this.radii_u_buffer = zeros(this.numGaussians, 1, ...
+                miniBatchSize, 'like', refArr);
+            this.radii_v_buffer = zeros(this.numGaussians, 1, ...
+                miniBatchSize, 'like', refArr);
+            this.colors_buffer = dlarray(zeros(this.numGaussians, 1, 3, ...
+                miniBatchSize, 'like', refArr), 'SSCB');
 
-            % --- Move all learnable parameters to GPU ---
-            % Unconditional: minibatchqueue always delivers with
-            % OutputEnvironment='gpu' so GPU residency is guaranteed.
-            fprintf('Moving learnable parameters to GPU...\n');
-            this.params.pws        = gpuArray(this.params.pws);
-            this.params.shs        = gpuArray(this.params.shs);
-            this.params.scales_raw = gpuArray(this.params.scales_raw);
-            this.params.alphas_raw = gpuArray(this.params.alphas_raw);
-            this.params.rots_raw   = gpuArray(this.params.rots_raw);
+            % --- Move learnable parameters to match data residency ---
+            % No fresh array to hang 'like' off here (these already exist as
+            % CPU dlarrays), so gate the move on the same useGPU decision.
+            if this.useGPU
+                fprintf('Moving learnable parameters to GPU...\n');
+                this.params.pws        = gpuArray(this.params.pws);
+                this.params.shs        = gpuArray(this.params.shs);
+                this.params.scales_raw = gpuArray(this.params.scales_raw);
+                this.params.alphas_raw = gpuArray(this.params.alphas_raw);
+                this.params.rots_raw   = gpuArray(this.params.rots_raw);
+            end
         end
 
         function [loss, grads] = modelStep(this, params)
@@ -479,7 +491,7 @@ classdef GaussianSplatter < handle
             rv_all = gather(reshape(this.radii_v_buffer(1:numValid, 1, :), numValid, []));
 
             % CPU bounding boxes [numValid x B], reused by rasterizeToGPU.
-            % Slots beyond an element's own valid count are zeroed upstream
+            % Invalid slots carry radius -1 (sentinel from projection)
             % → degenerate boxes → excluded by the overlap masks below.
             this.uminCPU = max(single(1.0), floor(u_all) - ru_all);
             this.umaxCPU = min(single(this.imageWidth),  ceil(u_all) + ru_all);
@@ -558,7 +570,7 @@ classdef GaussianSplatter < handle
                         y_t = this.Y_vec(tileVmin:tileVmax);  % [H' x 1]
 
                         % Tile-local transmittance carried across chunks
-                        T_tile = ones(numel(y_t), numel(x_t), 'single', 'gpuArray');
+                        T_tile = ones(numel(y_t), numel(x_t), 'like', this.T);
 
                         accR = single(0);
                         accG = single(0);
@@ -658,228 +670,191 @@ classdef GaussianSplatter < handle
             % Returns:
             %   numValid: number of Gaussians that passed frustum culling
             %
+            % FULLY VECTORIZED ACROSS THE BATCH: batch-independent quantities
+            % (opacity sigmoid, quaternion→rotation, world covariance) are
+            % computed once for all N Gaussians; batch-dependent quantities
+            % (camera transform, projection, Sigma2D, colors) as [N x B]
+            % arrays; Sigma_2D = J*Sigma_cam*J^T is expanded elementwise so
+            % no per-element J matrices are built. Depth sorting is done
+            % column-wise and results are scattered into the persistent
+            % buffers with pure indexing — no per-batch-element compute loop.
+            %
             % OUTPUT BUFFERS (persistent, reused every batch):
             %   this.u_buffer           [numGaussians x 1 x 1 x B]
             %   this.v_buffer           [numGaussians x 1 x 1 x B]
             %   this.alphas_buffer      [numGaussians x 1 x 1 x B]
             %   this.Sigma2D_inv_buffer [numGaussians x 2 x 2 x B]
-            %   this.radii_u_buffer     [numGaussians x 1 x B]
-            %   this.radii_v_buffer     [numGaussians x 1 x B]
+            %   this.radii_u_buffer     [numGaussians x 1 x B] (-1 = invalid slot)
+            %   this.radii_v_buffer     [numGaussians x 1 x B] (-1 = invalid slot)
             %   this.colors_buffer      [numGaussians x 1 x 3 x B]
 
-            % Zero persistent buffers at start of batch
-            this.u_buffer(:) = 0;
-            this.v_buffer(:) = 0;
-            this.alphas_buffer(:) = 0;
-            this.Sigma2D_inv_buffer(:) = 0;
-            this.radii_u_buffer(:) = 0;
-            this.radii_v_buffer(:) = 0;
-            this.colors_buffer(:) = 0;
+            N = size(params.pws, 1);
+            B = this.miniBatchSize;
 
-            % Transform world-space positions to camera space
-            gaussians = pagemtimes( ...
-                repmat(params.pws, 1, 1, this.miniBatchSize), 'none', ...
+            % ---- Camera-space positions for all Gaussians x batch [N x 3 x B]
+            p_cam = pagemtimes( ...
+                repmat(params.pws, 1, 1, B), 'none', ...
                 stripdims(this.camera.Rcw), 'transpose');
-            gaussians = gaussians + repmat( ...
-                pagetranspose(reshape(stripdims(this.camera.tcw), 3, 1, this.miniBatchSize)), ...
-                size(params.pws, 1), 1, 1);
+            p_cam = p_cam + repmat( ...
+                pagetranspose(reshape(stripdims(this.camera.tcw), 3, 1, B)), N, 1, 1);
 
-            % Perspective projection: divide X,Y by Z, then apply full-frame intrinsics.
-            % cx, cy, fx, fy correspond to the full downscaled image (not a tile).
-            inv_z = single(1.0) ./ max(gaussians(:, 3, :), single(1e-6));
-            gaussians(:, 1, :) = gaussians(:, 1, :) .* inv_z ...
-                             .* reshape(this.camera.fx, 1, 1, this.miniBatchSize) ...
-                             + reshape(this.camera.cx, 1, 1, this.miniBatchSize);
-            gaussians(:, 2, :) = gaussians(:, 2, :) .* inv_z ...
-                             .* reshape(this.camera.fy, 1, 1, this.miniBatchSize) ...
-                             + reshape(this.camera.cy, 1, 1, this.miniBatchSize);
+            x_cam  = reshape(p_cam(:, 1, :), N, B);
+            y_cam  = reshape(p_cam(:, 2, :), N, B);
+            z_cam  = reshape(p_cam(:, 3, :), N, B);
+            z_safe = max(z_cam, single(1e-6));
 
-            % Frustum culling: keep Gaussians within depth bounds and a
-            % screen-margin safety window. The margin has a 128 px floor so
-            % large splats reaching into a small block canvas from outside
-            % are not culled (50% of a ~100 px block would be too tight).
+            % ---- Perspective projection to block-local pixel coords [N x B]
+            fxr = reshape(this.camera.fx, 1, B);
+            fyr = reshape(this.camera.fy, 1, B);
+            u_all = x_cam ./ z_safe .* fxr + reshape(this.camera.cx, 1, B);
+            v_all = y_cam ./ z_safe .* fyr + reshape(this.camera.cy, 1, B);
+
+            % ---- Frustum culling (plain gpuArray; culling needs no gradients).
+            % Margin has a 128 px floor so large splats reaching into a small
+            % block canvas from outside are not culled.
             marginW = max(single(this.imageWidth)  * single(0.5), single(128));
             marginH = max(single(this.imageHeight) * single(0.5), single(128));
-            valid = (gaussians(:, 3, :) >  single(0.2))                            & ...
-                    (gaussians(:, 3, :) <  single(100.0))                          & ...
-                    (gaussians(:, 1, :) > -marginW)                                & ...
-                    (gaussians(:, 1, :) <  single(this.imageWidth)  + marginW)     & ...
-                    (gaussians(:, 2, :) > -marginH)                                & ...
-                    (gaussians(:, 2, :) <  single(this.imageHeight) + marginH);
+            u_nd = extractdata(u_all);
+            v_nd = extractdata(v_all);
+            z_nd = extractdata(z_cam);
+            valid = z_nd > single(0.2) & z_nd < single(100.0) & ...
+                    u_nd > -marginW & u_nd < single(this.imageWidth)  + marginW & ...
+                    v_nd > -marginH & v_nd < single(this.imageHeight) + marginH;
 
-            % If no guassians splat in 2d image return empty image
-            nr_valid = sum(valid, 1);
-            if ~any(nr_valid)
-                numValid = 0;
+            nr_valid = sum(valid, 1);            % [1 x B]
+            numValid = gather(max(nr_valid));
+            if numValid == 0
                 return;
             end
 
-            % Extract only once per batch
-            for j = 1:this.miniBatchSize
-                % Sort surviving Gaussians back-to-front by depth (Painter's Algorithm)
-                valid_b = extractdata(valid(:, :, j));
-                gaussians_z_b = extractdata(gaussians(valid_b, 3, j));
+            % ---- Depth sort per batch column (back-to-front, invalid sink last)
+            z_masked         = z_nd;
+            z_masked(~valid) = -Inf;
+            [~, sortOrder]   = sort(z_masked, 1, 'descend');  % [N x B]
+            linIdx  = sortOrder + (0:B-1) * N;                % linear into [N x B]
+            rowMask = (1:N)' <= nr_valid;                     % valid-slot mask
 
-                [~, sortIdx] = sort(gaussians_z_b, 'descend');
-                validIdx     = find(valid_b);
-                sortIdx      = validIdx(sortIdx);
-                numIdx       = length(sortIdx);
+            % ---- Batch-independent quantities (computed ONCE, not per element)
+            % Opacity: sigmoid of raw logit, clamped for stability
+            alph = min(single(1.0) ./ (single(1.0) + exp(-params.alphas_raw)), single(1.0));
 
-                if numIdx == 0
-                    continue;
-                end
+            % Quaternion → rotation matrix, vectorized over all N
+            quat = params.rots_raw ./ max(vecnorm(params.rots_raw, 2, 2), 1e-6);
+            qw = quat(:, 1); qx = quat(:, 2); qy = quat(:, 3); qz = quat(:, 4);
 
-                % Screen-space centres in block-local pixel coordinates
-                this.u_buffer(1:numIdx, 1, 1, j) = gaussians(sortIdx, 1, j);
-                this.v_buffer(1:numIdx, 1, 1, j) = gaussians(sortIdx, 2, j);
+            R_cols = [single(1.0) - single(2.0) .* (qy .* qy + qz .* qz), ...
+                      single(2.0) .* (qx .* qy - qw .* qz), ...
+                      single(2.0) .* (qx .* qz + qw .* qy), ...
+                      single(2.0) .* (qx .* qy + qw .* qz), ...
+                      single(1.0) - single(2.0) .* (qx .* qx + qz .* qz), ...
+                      single(2.0) .* (qy .* qz - qw .* qx), ...
+                      single(2.0) .* (qx .* qz - qw .* qy), ...
+                      single(2.0) .* (qy .* qz + qw .* qx), ...
+                      single(1.0) - single(2.0) .* (qx .* qx + qy .* qy)];
 
-                % Camera-space positions of surviving Gaussians (before projection)
-                % Needed for J computation: x_cam, y_cam, z_cam
-                % IMPORTANT: Avoid recomputing camera-space positions.
-                % The gaussians variable contains world→camera transformation,
-                % but we need camera-space coords for the Jacobian before perspective proj.
-                x_cam_full = pagemtimes( ...
-                    repmat(params.pws, 1, 1, 1), 'none', ...
-                    this.camera.Rcw(:, :, j), 'transpose') ...
-                    + pagetranspose(reshape(this.camera.tcw(:, j), 3, 1, 1));
-                x_cam = x_cam_full(sortIdx, 1);
-                y_cam = x_cam_full(sortIdx, 2);
-                z_cam = max(x_cam_full(sortIdx, 3), single(1e-6));
+            M = reshape(R_cols', 3, 3, N);
 
-                % Opacity: sigmoid activation of raw logit
-                % Clamp to [0, 1] for numerical stability
-                alphas_raw = single(1.0) ./ (single(1.0) + exp(-params.alphas_raw(sortIdx)));
-                this.alphas_buffer(1:numIdx, 1, 1, j) = min(alphas_raw, single(1.0));
+            % M = R * diag(s): scale each column by clamped exp(scales)
+            sx = exp(min(max(params.scales_raw(:, 1), single(-10)), single(10)));
+            sy = exp(min(max(params.scales_raw(:, 2), single(-10)), single(10)));
+            sz = exp(min(max(params.scales_raw(:, 3), single(-10)), single(10)));
 
-                % Normalize quaternions to unit length before rotation conversion
-                quat = params.rots_raw(sortIdx, :);
-                quat = quat ./ max(vecnorm(quat, 2, 2), 1e-6);
+            M(1, 1, :) = M(1, 1, :) .* reshape(sx, 1, 1, []);
+            M(2, 1, :) = M(2, 1, :) .* reshape(sx, 1, 1, []);
+            M(3, 1, :) = M(3, 1, :) .* reshape(sx, 1, 1, []);
+            M(1, 2, :) = M(1, 2, :) .* reshape(sy, 1, 1, []);
+            M(2, 2, :) = M(2, 2, :) .* reshape(sy, 1, 1, []);
+            M(3, 2, :) = M(3, 2, :) .* reshape(sy, 1, 1, []);
+            M(1, 3, :) = M(1, 3, :) .* reshape(sz, 1, 1, []);
+            M(2, 3, :) = M(2, 3, :) .* reshape(sz, 1, 1, []);
+            M(3, 3, :) = M(3, 3, :) .* reshape(sz, 1, 1, []);
 
-                % Vectorized quaternion → rotation matrix construction
-                qw = quat(:, 1); qx = quat(:, 2); qy = quat(:, 3); qz = quat(:, 4);
+            % Sigma_world = M * M^T  [3 x 3 x N]
+            Sw = pagemtimes(M, 'none', M, 'transpose');
 
-                % Build all 9 columns of rotation matrix at once
-                R_cols = [single(1.0) - single(2.0) .* (qy .* qy + qz .* qz), ...
-                          single(2.0) .* (qx .* qy - qw .* qz), ...
-                          single(2.0) .* (qx .* qz + qw .* qy), ...
-                          single(2.0) .* (qx .* qy + qw .* qz), ...
-                          single(1.0) - single(2.0) .* (qx .* qx + qz .* qz), ...
-                          single(2.0) .* (qy .* qz - qw .* qx), ...
-                          single(2.0) .* (qx .* qz - qw .* qy), ...
-                          single(2.0) .* (qy .* qz + qw .* qx), ...
-                          single(1.0) - single(2.0) .* (qx .* qx + qy .* qy)];
+            % ---- Camera-space covariance for all N x B (explicit page expansion)
+            RcwN = repmat(reshape(stripdims(this.camera.Rcw), 3, 3, 1, B), 1, 1, N, 1);
+            SwB  = repmat(reshape(Sw, 3, 3, N, 1), 1, 1, 1, B);
+            Scam = pagemtimes(pagemtimes(RcwN, SwB), 'none', RcwN, 'transpose');
 
-                Sigma = reshape(R_cols', 3, 3, numIdx);  % Reshape [numIdx×9] → [3×3×numIdx]
+            S11 = reshape(Scam(1, 1, :, :), N, B);
+            S12 = reshape(Scam(1, 2, :, :), N, B);
+            S13 = reshape(Scam(1, 3, :, :), N, B);
+            S22 = reshape(Scam(2, 2, :, :), N, B);
+            S23 = reshape(Scam(2, 3, :, :), N, B);
+            S33 = reshape(Scam(3, 3, :, :), N, B);
 
-                % Build 3D world covariance Sigma_world = Sigma*S^2*Sigma^T
-                sx = exp(min(max(params.scales_raw(sortIdx, 1), single(-10)), single(10)));
-                sy = exp(min(max(params.scales_raw(sortIdx, 2), single(-10)), single(10)));
-                sz = exp(min(max(params.scales_raw(sortIdx, 3), single(-10)), single(10)));
+            % ---- Sigma_2D = J*Sigma_cam*J^T expanded elementwise.
+            % J rows: j1 = [fx/z, 0, -fx*x/z^2], j2 = [0, fy/z, -fy*y/z^2],
+            % so no [2x3xNxB] J matrices are materialized.
+            t1 = fxr ./ z_safe;
+            t3 = -fxr .* x_cam ./ (z_safe .^ 2);
+            w2 = fyr ./ z_safe;
+            w3 = -fyr .* y_cam ./ (z_safe .^ 2);
 
-                % Sigma = Sigma * diag(s): scale each column of Sigma in-place
-                Sigma(1, 1, :) = Sigma(1, 1, :) .* reshape(sx, 1, 1, []);
-                Sigma(2, 1, :) = Sigma(2, 1, :) .* reshape(sx, 1, 1, []);
-                Sigma(3, 1, :) = Sigma(3, 1, :) .* reshape(sx, 1, 1, []);
-                Sigma(1, 2, :) = Sigma(1, 2, :) .* reshape(sy, 1, 1, []);
-                Sigma(2, 2, :) = Sigma(2, 2, :) .* reshape(sy, 1, 1, []);
-                Sigma(3, 2, :) = Sigma(3, 2, :) .* reshape(sy, 1, 1, []);
-                Sigma(1, 3, :) = Sigma(1, 3, :) .* reshape(sz, 1, 1, []);
-                Sigma(2, 3, :) = Sigma(2, 3, :) .* reshape(sz, 1, 1, []);
-                Sigma(3, 3, :) = Sigma(3, 3, :) .* reshape(sz, 1, 1, []);
+            % 0.3*I low-pass filter folded into the diagonal terms
+            a  = t1.^2 .* S11 + single(2.0) .* t1 .* t3 .* S13 + t3.^2 .* S33 + single(0.3);
+            bb = (t1 .* S12 + t3 .* S23) .* w2 + (t1 .* S13 + t3 .* S33) .* w3;
+            d  = w2.^2 .* S22 + single(2.0) .* w2 .* w3 .* S23 + w3.^2 .* S33 + single(0.3);
 
-                % Sigma_world = Sigma * Sigma^T
-                Sigma = pagemtimes(Sigma, 'none', Sigma, 'transpose');
+            % Analytic 2x2 inverse [N x B]
+            inv_det = single(1.0) ./ max(a .* d - bb .* bb, single(1e-6));
+            i11 =  d  .* inv_det;
+            i12 = -bb .* inv_det;
+            i22 =  a  .* inv_det;
 
-                % Transform to camera space
-                Rcw_b = this.camera.Rcw(:, :, j);
-                Sigma = pagemtimes(pagemtimes(Rcw_b, Sigma), pagetranspose(Rcw_b));
+            % ---- Pixel radii from the larger Sigma2D eigenvalue (3-sigma, plain)
+            a_nd = extractdata(a);
+            b_nd = extractdata(bb);
+            d_nd = extractdata(d);
+            mid   = single(0.5) .* (a_nd + d_nd);
+            delta = sqrt(max(single(0.25) .* (a_nd - d_nd).^2 + b_nd.^2, single(0.0)));
+            r_all = ceil(single(3.0) .* sqrt(max(mid + delta, single(0.0))));  % [N x B]
 
-                % Project to 2D using affine Jacobian J (2x3)
-                fx  = single(this.camera.fx(j));
-                fy  = single(this.camera.fy(j));
-                iz  = reshape(single(1.0) ./ z_cam, 1, 1, []);
-                iz2 = iz .* iz;
-                xc  = reshape(x_cam, 1, 1, []);
-                yc  = reshape(y_cam, 1, 1, []);
+            % ---- Spherical harmonic colors for all N x B
+            tw_r = reshape(stripdims(this.camera.twc), 1, 3, B);
+            vd   = params.pws - tw_r;                       % [N x 3 x B]
+            vd   = vd ./ max(vecnorm(vd, 2, 2), 1e-6);
+            vx   = vd(:, 1, :); vy = vd(:, 2, :); vz = vd(:, 3, :);
 
-                J          = dlarray(gpuArray(zeros(2, 3, numIdx, 'single')));
-                J(1, 1, :) = fx .* iz;
-                J(1, 2, :) = single(0.0);
-                J(1, 3, :) = -fx .* xc .* iz2;
-                J(2, 1, :) = single(0.0);
-                J(2, 2, :) = fy .* iz;
-                J(2, 3, :) = -fy .* yc .* iz2;
+            c  = this.shToColor;
+            Sh = cat(2, ...
+                c(1) .* ones(N, 1, B, 'like', params.pws), ...
+                c(2) .* (-vx), ...
+                c(3) .* (-vy), ...
+                c(4) .* vz, ...
+                c(5) .* (vx .* vy), ...
+                c(6) .* (-vx .* vz), ...
+                c(7) .* (-vy .* vz), ...
+                c(8) .* (single(3.0) .* vz .* vz - single(1.0)), ...
+                c(9) .* (vx .* vx - vy .* vy));             % [N x 9 x B]
 
-                % Sigma_2D = J * Sigma_cam * J^T
-                Sigma = pagemtimes(pagemtimes(J, Sigma), pagetranspose(J));
+            colR = reshape(max(min(single(0.5) + sum(Sh .* params.shs(:, :, 1), 2), ...
+                single(1.0)), single(0.0)), N, B);
+            colG = reshape(max(min(single(0.5) + sum(Sh .* params.shs(:, :, 2), 2), ...
+                single(1.0)), single(0.0)), N, B);
+            colB = reshape(max(min(single(0.5) + sum(Sh .* params.shs(:, :, 3), 2), ...
+                single(1.0)), single(0.0)), N, B);
 
-                % Low-pass filter — add 0.3*I to prevent singularities
-                % when a Gaussian projects to sub-pixel size.
-                Sigma(1, 1, :) = Sigma(1, 1, :) + single(0.3);
-                Sigma(2, 2, :) = Sigma(2, 2, :) + single(0.3);
+            % ---- Scatter depth-sorted values into persistent buffers (indexing only)
+            this.u_buffer(:, :, :, :)      = reshape(u_all(linIdx),   N, 1, 1, B);
+            this.v_buffer(:, :, :, :)      = reshape(v_all(linIdx),   N, 1, 1, B);
+            this.alphas_buffer(:, :, :, :) = reshape(alph(sortOrder), N, 1, 1, B);
 
-                % Invert 2x2 covariance analytically.
-                a   = Sigma(1, 1, :);
-                b   = Sigma(1, 2, :);
-                d   = Sigma(2, 2, :);
-                inv_det = single(1.0) ./ max(a .* d - b .* b, single(1e-6));
+            this.Sigma2D_inv_buffer(:, 1, 1, :) = reshape(i11(linIdx), N, 1, 1, B);
+            this.Sigma2D_inv_buffer(:, 1, 2, :) = reshape(i12(linIdx), N, 1, 1, B);
+            this.Sigma2D_inv_buffer(:, 2, 1, :) = reshape(i12(linIdx), N, 1, 1, B);
+            this.Sigma2D_inv_buffer(:, 2, 2, :) = reshape(i22(linIdx), N, 1, 1, B);
 
-                a_r = reshape(a, [], 1);
-                b_r = reshape(b, [], 1);
-                d_r = reshape(d, [], 1);
-                i_r = reshape(inv_det, [], 1);
-                
-                this.Sigma2D_inv_buffer(1:numIdx, 1, 1, j) =  d_r .* i_r;
-                this.Sigma2D_inv_buffer(1:numIdx, 1, 2, j) = -b_r .* i_r;
-                this.Sigma2D_inv_buffer(1:numIdx, 2, 1, j) = -b_r .* i_r;
-                this.Sigma2D_inv_buffer(1:numIdx, 2, 2, j) =  a_r .* i_r;
+            this.colors_buffer(:, 1, 1, :) = reshape(colR(linIdx), N, 1, 1, B);
+            this.colors_buffer(:, 1, 2, :) = reshape(colG(linIdx), N, 1, 1, B);
+            this.colors_buffer(:, 1, 3, :) = reshape(colB(linIdx), N, 1, 1, B);
 
-                % Separate horizontal and vertical pixel radii for tile culling
-                a_data = squeeze(extractdata(a));
-                d_data = squeeze(extractdata(d));
-                b_data = squeeze(extractdata(b));
-
-                mid   = single(0.5) .* (a_data + d_data);
-                delta = sqrt(max(single(0.25) .* (a_data - d_data).^2 + b_data.^2, single(0.0)));
-                lam_max  = mid + delta; % larger eigenvalue
-
-                this.radii_u_buffer(1:numIdx, 1, j) = ceil(single(3.0) .* sqrt(max(lam_max, single(0.0))));
-                this.radii_v_buffer(1:numIdx, 1, j) = ceil(single(3.0) .* sqrt(max(lam_max, single(0.0))));
-
-                % Get world-space camera center
-                C_world = this.camera.twc(:, j);  % Camera center in world coordinates
-
-                % Get world-space Gaussian positions (use original params.pws, NOT gaussians)
-                view_dir = params.pws(sortIdx, :);  % [numIdx × 3]
-
-                % Compute view direction: from camera center to Gaussian
-                view_dir = view_dir - repmat(C_world', numIdx, 1);  % [numIdx × 3]
-
-                % Unit-normalise direction for spherical harmonic evaluation
-                view_dir = view_dir ./ max(vecnorm(view_dir, 2, 2), 1e-6);
-
-                % Evaluate second-order spherical harmonics for RGB color
-                Sh = zeros(numIdx, length(this.shToColor), 'single');
-                Sh(:, 1) = this.shToColor(1);
-                Sh(:, 2) = this.shToColor(2) .* (-view_dir(:, 1));
-                Sh(:, 3) = this.shToColor(3) .* (-view_dir(:, 2));
-                Sh(:, 4) = this.shToColor(4) .* ( view_dir(:, 3));
-                Sh(:, 5) = this.shToColor(5) .* ( view_dir(:, 1) .* view_dir(:, 2));
-                Sh(:, 6) = this.shToColor(6) .* (-view_dir(:, 1) .* view_dir(:, 3));
-                Sh(:, 7) = this.shToColor(7) .* (-view_dir(:, 2) .* view_dir(:, 3));
-                Sh(:, 8) = this.shToColor(8) .* (single(3.0) .* view_dir(:, 3) .* view_dir(:, 3) - single(1.0));
-                Sh(:, 9) = this.shToColor(9) .* (view_dir(:, 1) .* view_dir(:, 1) - view_dir(:, 2) .* view_dir(:, 2));
-
-                % Clamp colors to valid [0, 1] range after SH expansion
-                this.colors_buffer(1:numIdx, 1, 1, j) = dlarray(max(min( ...
-                    single(0.5) + sum(Sh .* params.shs(sortIdx, :, 1), 2), single(1.0)), single(0.0)), 'SSC');
-                this.colors_buffer(1:numIdx, 1, 2, j) = dlarray(max(min( ...
-                    single(0.5) + sum(Sh .* params.shs(sortIdx, :, 2), 2), single(1.0)), single(0.0)), 'SSC');
-                this.colors_buffer(1:numIdx, 1, 3, j) = dlarray(max(min( ...
-                    single(0.5) + sum(Sh .* params.shs(sortIdx, :, 3), 2), single(1.0)), single(0.0)), 'SSC');
-            end
-
-            numValid = max(extractdata(nr_valid));
+            % Invalid slots get radius -1 → degenerate bbox → excluded downstream
+            r_sorted = r_all(linIdx);
+            r_sorted(~rowMask) = single(-1.0);
+            this.radii_u_buffer(:, :, :) = reshape(r_sorted, N, 1, B);
+            this.radii_v_buffer(:, :, :) = reshape(r_sorted, N, 1, B);
         end
 
         function pruneAndDensify(this, avgGrad, avgSqGrad, prunningRatio)
@@ -957,10 +932,93 @@ classdef GaussianSplatter < handle
             save(filename, "params");
         end
 
+        function previewResults(this, gaussianParams, numGenImages)
+            % Render numGenImages full images, each stitched back together
+            % from its blocks, comparing prediction vs ground truth — rather
+            % than showing individual (scrambled, out-of-order) blocks.
+            blockH = this.data.blockSize(1);
+            blockW = this.data.blockSize(2);
+            padH   = this.data.overlap(1);
+            padW   = this.data.overlap(2);
+            coreRows = (padH+1):(padH+blockH);
+            coreCols = (padW+1):(padW+blockW);
+
+            % Cheap metadata-only pass (no pixel decode) to group blocks by source image.
+            camRows = readall(this.data.cameras);
+            allIds  = cell2mat(camRows(:, 1));
+            uniqueIds = unique(allIds, 'stable');
+            numShow   = min(numGenImages, numel(uniqueIds));
+
+            previewFormat = ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"];
+
+            for n = 1:numShow
+                % All blocks belonging to this source image (blockId doubles as the
+                % 1-based read-order index, so it can be used directly with subset()).
+                blockIdx = find(allIds == uniqueIds(n));
+                numBlocksForImage = numel(blockIdx);
+
+                subDs  = subset(combine(this.data.images, this.data.cameras), blockIdx);
+                subMbq = minibatchqueue(subDs, ...
+                    'MiniBatchSize',    numBlocksForImage, ...
+                    'OutputEnvironment',GaussianSplatter.outEnv(this.useGPU), ...
+                    'MiniBatchFormat',  previewFormat);
+
+                [this.image_gt, ~, ~, camBlockRow, camBlockCol, camW, camH, camFx, camFy, camCx, camCy, ...
+                 this.camera.Rcw, this.camera.tcw, this.camera.twc] = next(subMbq);
+
+                this.camera.width  = squeeze(camW);
+                this.camera.height = squeeze(camH);
+                this.camera.fx     = squeeze(camFx);
+                this.camera.fy     = squeeze(camFy);
+                this.camera.cx     = squeeze(camCx);
+                this.camera.cy     = squeeze(camCy);
+
+                this.initStorage(numBlocksForImage);
+                this.createImage(gaussianParams);
+
+                blockRows = round(gather(extractdata(squeeze(camBlockRow))));
+                blockCols = round(gather(extractdata(squeeze(camBlockCol))));
+                numBlockRows = max(blockRows);
+                numBlockCols = max(blockCols);
+
+                predBlocks = gather(extractdata(this.image));
+                gtBlocks   = gather(extractdata(this.image_gt));
+
+                % Stitch blocks into full mosaics, cropping away each block's halo
+                % (overlap) so only its core blockSize region is placed in the canvas.
+                predFull = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
+                gtFull   = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
+
+                for b = 1:numBlocksForImage
+                    rowStart = (blockRows(b)-1)*blockH + 1;
+                    colStart = (blockCols(b)-1)*blockW + 1;
+                    predFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
+                        predBlocks(coreRows, coreCols, :, b);
+                    gtFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
+                        gtBlocks(coreRows, coreCols, :, b);
+                end
+
+                % Crop away PadPartialBlocks zero-padding beyond the true image extent
+                imgNum = this.data.images.BlockLocationSet.ImageNumber(blockIdx(1));
+                imgSz  = this.data.images.Images(imgNum).Size;
+                predFull = predFull(1:min(end, imgSz(1)), 1:min(end, imgSz(2)), :);
+                gtFull   = gtFull(1:min(end, imgSz(1)),   1:min(end, imgSz(2)), :);
+
+                subplot(ceil(numShow/floor(sqrt(numShow))), floor(sqrt(numShow)), n);
+                imshow(imtile(cat(4, predFull, gtFull)));
+                title(sprintf('Image id %d', uniqueIds(n)));
+            end
+            sgtitle("Generated Images (Prediction | Ground Truth)");
+        end
+
         function printGPUMemory(this, label)
             % Lightweight GPU memory diagnostics.
             % Call after initStorage, densification, or key training points
             % to verify memory usage is stable and not fragmenting.
+            if ~this.useGPU
+                fprintf('[%s] Running on CPU — no GPU memory to report.\n', label);
+                return;
+            end
             g = gpuDevice;
             used = g.TotalMemory - g.AvailableMemory;
             fprintf('[%s] GPU memory used: %.2f MB / %.2f MB\n', ...
@@ -968,7 +1026,45 @@ classdef GaussianSplatter < handle
         end
     end
 
+    methods (Static)
+        function env = outEnv(useGPU)
+            % Maps the useGPU flag to a minibatchqueue 'OutputEnvironment' value.
+            if useGPU
+                env = 'gpu';
+            else
+                env = 'cpu';
+            end
+        end
+    end
+
     methods (Static, Access = private)
+        function blockSize = autoSelectBlockSize(datasetPath)
+            % Auto-select a block size (per dimension, searched in [64, 160])
+            % that minimizes total blockedImageDatastore partial-block
+            % zero-padding summed over both resolution levels.
+            %
+            % Canvas sizes mirror ColmapData: Full = ceil(raw/kScaleDownFactor),
+            % Half = ceil(raw/(kScaleDownFactor*2)), with kScaleDownFactor = 2.
+            imds   = imageDatastore(fullfile(datasetPath, 'images'));
+            info   = imfinfo(imds.Files{1});
+            fullHW = ceil([info.Height, info.Width] / 2);
+            halfHW = ceil([info.Height, info.Width] / 4);
+
+            blockSize = zeros(1, 2);
+            for d = 1:2
+                bestPad = inf;
+                for b = 64:160
+                    pad = (ceil(fullHW(d)/b)*b - fullHW(d)) + (ceil(halfHW(d)/b)*b - halfHW(d));
+                    if pad <= bestPad   % <= prefers larger blocks (less per-block overhead)
+                        bestPad = pad;
+                        blockSize(d) = b;
+                    end
+                end
+            end
+            fprintf('Auto-selected block size: [%d %d] (full canvas %dx%d, half %dx%d)\n', ...
+                blockSize(1), blockSize(2), fullHW(1), fullHW(2), halfHW(1), halfHW(2));
+        end
+
         function paramStruct = createLearnableParams(gaussians)
             % Convert Gaussian struct of doubles to a struct of dlarrays.
             % All parameters start on CPU; initStorage migrates them to GPU.
