@@ -7,17 +7,27 @@
 %   - 192 GB/s memory bandwidth
 %   - 2560 CUDA cores (Ada Lovelace)
 %
-% Blocked Image Pipeline:
-%   Ground-truth images are loaded as blockedImage objects using the
-%   Image Processing Toolbox, decomposed into 256x256 tiles.
-%   Two single-level blockedImageDatastores are pre-built:
-%     imagesHalf : half-resolution for fast early-epoch convergence
-%     imagesFull : full resolution for fine-detail refinement
-%   Training starts at half-resolution and switches at levelSwitchEpoch.
-%   blockedImageDatastore.read() returns cell arrays; a transform()
-%   unwraps each cell to a plain H×W×C single array before combine().
-%   minibatchqueue with OutputEnvironment='gpu' transfers tiles
-%   directly to GPU VRAM, eliminating CPU staging copies.
+% Image Loading Design:
+%   Images are loaded as a blockedImageDatastore (ColmapData.images); each
+%   read() returns one fixed-size block (blockSize + 2*overlap), not a full
+%   image. Camera info is repeated once per block with cx/cy shifted to the
+%   block's local origin, so combine(obj.data.images, obj.data.cameras)
+%   still gives strict 1-to-1 correspondence.
+%
+% Tile-Aware GPU Rasterization:
+%   blockSize drives both the dataset's block grid (ColmapData) and
+%   GaussianSplatter.createImage()'s internal tile-culling loop. Because
+%   the L1/SSIM loss is computed directly on this.image/this.image_gt
+%   (now block-sized), the loss is automatically scoped to the block
+%   instead of the full image — increasing miniBatchSize below now simply
+%   increases the number of blocks processed per training step.
+%
+% Multi-Resolution Schedule:
+%   Training starts at half resolution (fast early convergence).
+%   At levelSwitchEpoch: setLevel(1) swaps both the image and camera
+%   datastores (block layout differs per resolution), then
+%   updateResolution() reallocates GPU buffers to the new block canvas size.
+%   Without updateResolution(), GPU buffers stay at half-res dimensions.
 
 %% Load Data
 % Specify the folder containing the SFM generated sparse 3D point cloud as
@@ -28,33 +38,59 @@ numGaussians = 2000; % More Gaussians creates sharper images, but needs more
                      % memory and has longer training time.
 numImages    = 20;
 
-%% Blocked Image Settings
-% Tile size for blockedImage decomposition.
-% 256x256 is optimal for the RTX 4050 Laptop (6 GB VRAM, 2560 CUDA cores).
-blockSize = [256, 256];
+%% Blocked Image / Tile Settings
+% Block/tile size used both by ColmapData's blockedImageDatastore (dataset
+% block grid) and by GaussianSplatter.createImage's internal tile-culling
+% loop. overlapSize adds a context halo (BorderSize) around each block;
+% it does NOT change the block grid, so it has no effect on padding —
+% only blockSize does.
+%
+% Auto-select the block size (per dimension, within [64, 160]) that
+% minimizes total partial-block zero-padding summed over both resolution
+% levels. Canvas sizes follow imresize: full = ceil(raw/2), half = ceil(raw/4).
+imds     = imageDatastore(fullfile(datasetPath, 'images'));
+info     = imfinfo(imds.Files{1});
+fullHW   = ceil([info.Height, info.Width] / 2);
+halfHW   = ceil([info.Height, info.Width] / 4);
+
+blockSize = zeros(1, 2);
+for d = 1:2
+    bestPad = inf;
+    for b = 64:160
+        pad = (ceil(fullHW(d)/b)*b - fullHW(d)) + (ceil(halfHW(d)/b)*b - halfHW(d));
+        if pad <= bestPad   % <= prefers larger blocks (less per-block overhead)
+            bestPad = pad;
+            blockSize(d) = b;
+        end
+    end
+end
+fprintf('Auto block size: [%d %d] (full canvas %dx%d, half %dx%d)\n', ...
+    blockSize(1), blockSize(2), fullHW(1), fullHW(2), halfHW(1), halfHW(2));
+
+overlapSize = [8, 8];
 
 %% Define Learnable Parameters
 % Construct object to load data and create learnable parameters.
-% blockSize is passed so the tile-aware rasterizer uses the same tile
-% dimensions as the blockedImageDatastore.
-obj = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize);
+obj = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize, overlapSize);
 
 %% Specify Training Options
-% Train for numEpochs epochs with a mini-batch size of 2.
-% miniBatchSize=2 keeps VRAM usage balanced on the RTX 4050 6 GB budget.
-miniBatchSize = 2;
+% miniBatchSize now counts BLOCKS (not full images) per training step —
+% raise it to increase the number of blocked images processed per batch.
+totalNumBlocks = obj.data.images.TotalNumBlocks;
+miniBatchSize = 2*totalNumBlocks/numImages;
 numEpochs     = ceil(numGaussians / 20);
 
 % Adam optimization options
 learnRate     = 0.02;
 learnInterval = ceil(numEpochs / 5);
-gradDecay     = 1 - miniBatchSize / numImages;
+gradDecay     = 1 - miniBatchSize / totalNumBlocks;
 sqGradDecay   = 0.999;
 
 %% Multi-Resolution Schedule
 % Switch from half-resolution to full resolution at 30% of total epochs.
-% Early epochs converge faster at lower resolution; later epochs refine
-% fine details at full resolution.
+% After setLevel(1), updateResolution() must be called to reallocate GPU
+% buffers (image, X, Y, T) to the new canvas dimensions. Without this,
+% buffers remain at half-resolution, clipping Gaussian projections.
 levelSwitchEpoch = max(1, floor(numEpochs * 0.3));
 
 %% Train Model
@@ -63,20 +99,25 @@ levelSwitchEpoch = max(1, floor(numEpochs * 0.3));
 doTraining = true;
 
 %% Create minibatchqueue
-% Combine the image tile datastore with the camera label datastores.
-% blockedImageDatastore.read() returns a cell array of blocks.
-% ColmapData.unwrapBlockCell (applied via transform in ColmapData) converts
-% each cell to a plain H×W×C single array so combine/horzcat succeeds.
+% combine() merges the blocked-image datastore with the per-block camera
+% arrayDatastores. 1-to-1 correspondence is guaranteed because ColmapData
+% repeats/offsets one camera entry per block, matching blockedImageDatastore's
+% read order.
 %
-% OutputEnvironment='gpu' transfers each block directly to GPU VRAM,
-% bypassing a redundant CPU staging copy on the RTX 4050.
+% OutputEnvironment='gpu' transfers each block directly to GPU VRAM on
+% the RTX 4050, bypassing a redundant CPU staging copy.
+%
+% MiniBatchFormat:
+%   Image:            'SSCB' (H × W × Channel × Batch)
+%   Camera scalars:   'CB'   (1 × Batch — arrayDatastore adds leading dim)
+%   Rcw rotation:     'SSCB' (3 × 3 × 1 × Batch)
+%   tcw, twc vectors: 'SCB'  (3 × 1 × Batch)
 ds = combine(obj.data.images, obj.data.cameras);
-
 mbq = minibatchqueue(ds, ...
     'MiniBatchSize',    miniBatchSize, ...
     'PartialMiniBatch', 'discard', ...
     'OutputEnvironment','gpu', ...
-    'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
+    'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
 
 %% Adaptive Densification Settings
 enableAdaptiveDensification = true;
@@ -88,7 +129,7 @@ avgGrad   = [];
 avgSqGrad = [];
 
 %% Training Progress Bookkeeping
-numIterationsPerEpoch = ceil(numImages / miniBatchSize);
+numIterationsPerEpoch = ceil(totalNumBlocks / miniBatchSize);
 numIterations         = numEpochs * numIterationsPerEpoch;
 
 if doTraining
@@ -99,8 +140,9 @@ if doTraining
 end
 
 %% Initialize Preview Render Index
-imageIdxToShow = preview(obj.data.cameras);
-imageIdxToShow = imageIdxToShow{1};
+% Lock onto a single, unique blockId (not the reused source-image id) so
+% the live preview always shows the same physical block across epochs.
+blockIdxToShow = 1;
 
 %% Custom Training Loop
 if doTraining
@@ -111,20 +153,33 @@ if doTraining
         epoch = epoch + 1;
 
         % -----------------------------------------------------------------
-        % Multi-resolution schedule: switch to full-resolution at the
-        % configured epoch threshold. setLevel() swaps obj.data.images
-        % from imagesHalf to imagesFull without reloading any data.
+        % Multi-resolution schedule.
+        % Step 1: setLevel(1) swaps obj.data.images/cameras from the Half
+        %         pair to the Full pair (block layout differs per level,
+        %         so images and cameras must switch together).
+        % Step 2: updateResolution() reads the new block canvas size from
+        %         the datastore and reallocates GPU buffers (image, X, Y, T).
+        %         Without this call, GPU buffers stay at half-res size.
+        % Step 3: Rebuild ds and mbq so they reference the new datastores,
+        %         and recompute totalNumBlocks/gradDecay (block count per
+        %         image differs between resolution levels).
         % -----------------------------------------------------------------
         if epoch == levelSwitchEpoch
             obj.data.setLevel(1);
-            % Rebuild combined datastore and minibatchqueue at new resolution
+            obj.updateResolution();
             ds  = combine(obj.data.images, obj.data.cameras);
             mbq = minibatchqueue(ds, ...
                 'MiniBatchSize',    miniBatchSize, ...
                 'PartialMiniBatch', 'discard', ...
                 'OutputEnvironment','gpu', ...
-                'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
+                'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
+            totalNumBlocks        = obj.data.images.TotalNumBlocks;
+            gradDecay             = 1 - miniBatchSize / totalNumBlocks;
+            numIterationsPerEpoch = ceil(totalNumBlocks / miniBatchSize);
             fprintf('Switched to full-resolution training at epoch %d.\n', epoch);
+
+            % Print GPU Memory
+            obj.printGPUMemory(sprintf('[Resolution Switch] Epoch %d', epoch));
         end
 
         % Shuffle data at the start of each epoch
@@ -133,24 +188,28 @@ if doTraining
         while hasdata(mbq) && ~monitor.Stop
             iteration = iteration + 1;
 
-            % Fetch next mini-batch of image tiles and camera parameters.
-            % Data arrives on GPU due to OutputEnvironment='gpu'.
-            % Camera scalars come as 'CB' format — squeeze removes the
-            % leading channel dimension to give plain 1×B vectors.
-            [obj.image_gt, camId, camW, camH, camFx, camFy, camCx, camCy, ...
+            % Fetch next mini-batch. Data arrives on GPU (OutputEnvironment='gpu').
+            % Camera scalars arrive as 'CB' (1×B); squeeze removes leading dim.
+            % blockRow/blockCol are only needed for post-training stitching,
+            % so they're ignored (~) in the hot training loop.
+            [obj.image_gt, camId, camBlockId, ~, ~, camW, camH, camFx, camFy, camCx, camCy, ...
              obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(mbq);
 
-            obj.camera.id     = squeeze(camId);
-            obj.camera.width  = squeeze(camW);
-            obj.camera.height = squeeze(camH);
-            obj.camera.fx     = squeeze(camFx);
-            obj.camera.fy     = squeeze(camFy);
-            obj.camera.cx     = squeeze(camCx);
-            obj.camera.cy     = squeeze(camCy);
+            obj.camera.id      = squeeze(camId);
+            obj.camera.blockId = squeeze(camBlockId);
+            obj.camera.width   = squeeze(camW);
+            obj.camera.height  = squeeze(camH);
+            obj.camera.fx      = squeeze(camFx);
+            obj.camera.fy      = squeeze(camFy);
+            obj.camera.cx      = squeeze(camCx);
+            obj.camera.cy      = squeeze(camCy);
 
             if iteration == 1
                 % Initialize GPU storage once on the first iteration
                 obj.initStorage(miniBatchSize);
+
+                % Print GPU Memory
+                obj.printGPUMemory('[Iteration 1] After GPU allocation');
             end
 
             % Forward pass, loss computation, and gradient calculation
@@ -167,15 +226,18 @@ if doTraining
             % Update training progress monitor
             recordMetrics(monitor, iteration, Loss=loss);
             updateInfo(monitor, Epoch=epoch + " of " + numEpochs);
-            monitor.Progress = 100 * iteration / numIterations;
+            monitor.Progress = min(max(100 * iteration / numIterations,0),100);
 
-            % Visualize the current render for a fixed reference view
-            idx = find(extractdata(obj.camera.id) == imageIdxToShow);
+            % Visualize the current render for a fixed reference block
+            idx = find(extractdata(obj.camera.blockId) == blockIdxToShow);
             if ~isempty(idx)
                 figure(1);
                 imshow(extractdata(obj.image(:,:,:,idx)));
                 title(sprintf('Epoch %d | Loss: %.4f', epoch, loss));
                 drawnow;
+
+                % Print GPU Memory
+                obj.printGPUMemory(sprintf('[Periodic Monitoring] Epoch %d', epoch));
             end
         end
 
@@ -186,7 +248,9 @@ if doTraining
         if enableAdaptiveDensification && ...
                 mod(epoch, densifyInterval) == 0 && ...
                 epoch > 1 && epoch < numEpochs
-            obj.pruneAndDensify(avgGrad, prunningRatio);
+            obj.printGPUMemory(sprintf('[Before Densify] Epoch %d', epoch));
+            obj.pruneAndDensify(avgGrad, avgSqGrad, prunningRatio);
+            obj.printGPUMemory(sprintf('[After Densify] Epoch %d', epoch));
         end
 
         % Decay learning rate at regular intervals
@@ -200,17 +264,43 @@ if doTraining
 end
 
 %% Preview Results
-% Render a grid of generated vs. ground-truth image pairs after training.
+% Render numGenImages full images, each stitched back together from its
+% blocks, comparing prediction vs ground truth — rather than showing
+% individual (scrambled, out-of-order) blocks.
 figure(2);
-numGenImages = 8;
+numGenImages = 4;
 load("gaussians.mat");
-shuffle(mbq);
 
-for iteration = 1:ceil(numGenImages / miniBatchSize)
-    [obj.image_gt, camId, camW, camH, camFx, camFy, camCx, camCy, ...
-     obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(mbq);
+blockH = obj.data.blockSize(1);
+blockW = obj.data.blockSize(2);
+padH   = obj.data.overlap(1);
+padW   = obj.data.overlap(2);
+coreRows = (padH+1):(padH+blockH);
+coreCols = (padW+1):(padW+blockW);
 
-    obj.camera.id     = squeeze(camId);
+% Cheap metadata-only pass (no pixel decode) to group blocks by source image.
+camRows = readall(obj.data.cameras);
+allIds  = cell2mat(camRows(:, 1));
+uniqueIds = unique(allIds, 'stable');
+numShow   = min(numGenImages, numel(uniqueIds));
+
+previewFormat = ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"];
+
+for n = 1:numShow
+    % All blocks belonging to this source image (blockId doubles as the
+    % 1-based read-order index, so it can be used directly with subset()).
+    blockIdx = find(allIds == uniqueIds(n));
+    numBlocksForImage = numel(blockIdx);
+
+    subDs  = subset(combine(obj.data.images, obj.data.cameras), blockIdx);
+    subMbq = minibatchqueue(subDs, ...
+        'MiniBatchSize',    numBlocksForImage, ...
+        'OutputEnvironment','gpu', ...
+        'MiniBatchFormat',  previewFormat);
+
+    [obj.image_gt, ~, ~, camBlockRow, camBlockCol, camW, camH, camFx, camFy, camCx, camCy, ...
+     obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(subMbq);
+
     obj.camera.width  = squeeze(camW);
     obj.camera.height = squeeze(camH);
     obj.camera.fx     = squeeze(camFx);
@@ -218,14 +308,39 @@ for iteration = 1:ceil(numGenImages / miniBatchSize)
     obj.camera.cx     = squeeze(camCx);
     obj.camera.cy     = squeeze(camCy);
 
-    if iteration == 1 && isempty(obj.image)
-        obj.initStorage(miniBatchSize);
-    end
+    obj.initStorage(numBlocksForImage);
     obj.createImage(params);
 
-    genImages = cat(4, gather(extractdata(obj.image)), ...
-                       gather(extractdata(obj.image_gt)));
-    subplot(2, 2, iteration);
-    imshow(imtile(genImages));
+    blockRows = round(gather(extractdata(squeeze(camBlockRow))));
+    blockCols = round(gather(extractdata(squeeze(camBlockCol))));
+    numBlockRows = max(blockRows);
+    numBlockCols = max(blockCols);
+
+    predBlocks = gather(extractdata(obj.image));
+    gtBlocks   = gather(extractdata(obj.image_gt));
+
+    % Stitch blocks into full mosaics, cropping away each block's halo
+    % (overlap) so only its core blockSize region is placed in the canvas.
+    predFull = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
+    gtFull   = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
+
+    for b = 1:numBlocksForImage
+        rowStart = (blockRows(b)-1)*blockH + 1;
+        colStart = (blockCols(b)-1)*blockW + 1;
+        predFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
+            predBlocks(coreRows, coreCols, :, b);
+        gtFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
+            gtBlocks(coreRows, coreCols, :, b);
+    end
+
+    % Crop away PadPartialBlocks zero-padding beyond the true image extent
+    imgNum = obj.data.images.BlockLocationSet.ImageNumber(blockIdx(1));
+    imgSz  = obj.data.images.Images(imgNum).Size;
+    predFull = predFull(1:min(end, imgSz(1)), 1:min(end, imgSz(2)), :);
+    gtFull   = gtFull(1:min(end, imgSz(1)),   1:min(end, imgSz(2)), :);
+
+    subplot(2, ceil(numShow/2), n);
+    imshow(imtile(cat(4, predFull, gtFull)));
+    title(sprintf('Image id %d', uniqueIds(n)));
 end
-sgtitle("Generated Images");
+sgtitle("Generated Images (Prediction | Ground Truth)");

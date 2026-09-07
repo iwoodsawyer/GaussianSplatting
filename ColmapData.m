@@ -5,84 +5,74 @@ classdef ColmapData < handle
     % Logic derived from gsplat_data.hpp:
     %   1. Loads Cameras, Images, and Points3D using ColmapLoader.
     %   2. Initializes Gaussians from Points3D.
-    %   3. Stores images as a blockedImageDatastore for lazy, tile-level
-    %      GPU loading using the Image Processing Toolbox.
-    %   4. Builds two separate single-level blockedImageDatastores:
-    %        - imagesHalf : half-resolution  (fast early-epoch convergence)
-    %        - imagesFull : full resolution  (fine-detail refinement)
-    %      obj.images points to imagesHalf initially.
-    %      Call obj.setLevel(1) to switch to imagesFull mid-training.
+    %   3. Stores images as a blockedImageDatastore: each read() returns one
+    %      fixed-size block (blockSize + 2*overlap), not a full image.
+    %   4. Two resolution levels are pre-built:
+    %        imagesHalf/camerasHalf : downscaled by kScaleDownFactor*2
+    %        imagesFull/camerasFull : downscaled by kScaleDownFactor
+    %      obj.images/obj.cameras start pointing to the Half level.
+    %      Call obj.setLevel(1) to switch to the Full level mid-training.
     %   5. Computes scene scale.
     %
-    % Blocked Image Pipeline design notes:
-    %
-    %   apply() always outputs a SINGLE-level blockedImage regardless of
-    %   whether the input is multi-level. Therefore makeMultiLevel2D is not
-    %   used here — instead two independent preprocessing passes are run:
-    %     Pass 1: apply at 'Level',1 from the file-backed bimArray  → full-res
-    %     Pass 2: apply at 'Level',1 after an imresize halving step  → half-res
-    %   Both outputs use 'Adapter', images.blocked.InMemory (no disk writes).
-    %
-    %   selectBlockLocations always operates on single-level images
-    %   (Levels must be <= 1 for single-level blockedImage objects).
-    %
-    %   blockedImageDatastore 'Level' is NOT a valid argument.
-    %   Resolution is controlled entirely via BlockLocationSet.
+    % Design note — camera info repeated per block:
+    %   blockedImageDatastore returns N blocks per image, while COLMAP has
+    %   exactly 1 camera entry per image. To preserve 1-to-1 correspondence
+    %   in combine(images, cameras), obj.cameras repeats each image's camera
+    %   entry once per block, with cx/cy shifted to that block's local
+    %   origin. The per-block pixel offset is computed from the datastore's
+    %   own BlockLocationSet via sub2world/world2sub, so it always matches
+    %   the datastore's actual read order. See buildBlockedLevel().
     %
     % Usage:
-    %   data = ColmapData('path/to/dataset', 2000, 20, [256 256], 2);
+    %   data = ColmapData('path/to/dataset', 2000, 20, [128 128], [0 0]);
     %   data.setLevel(1);   % switch to full resolution mid-training
-    %   tile = read(data.images);
+    %   img = read(data.images);
 
     properties
-        cameras      % Combined arrayDatastore: id,w,h,fx,fy,cx,cy,Rcw,tcw,twc
+        cameras      % Combined arrayDatastore: id,blockId,blockRow,blockCol,w,h,fx,fy,cx,cy,Rcw,tcw,twc
         images       % blockedImageDatastore currently active (half or full res)
         gaussians    % Struct: {pws, shs, scales, rots, alphas}
         scene_scale  % arrayDatastore: scene scale factor (float)
+        blockSize    % [H W] block size fed to blockedImage/blockedImageDatastore
+        overlap      % [H W] BorderSize (halo) added around each block
     end
 
     properties (Access = private)
-        % Two independent single-level datastores for resolution switching.
-        % apply() always produces single-level output so two separate
-        % preprocessing passes are used rather than makeMultiLevel2D.
-        imagesHalf          % blockedImageDatastore at half resolution
-        imagesFull          % blockedImageDatastore at full resolution
+        % Two independent blockedImageDatastore/camera pairs for resolution
+        % scheduling. Each pair is built once in the constructor since block
+        % layout (and therefore per-block camera offsets) differs per level.
+        imagesHalf   % blockedImageDatastore at half resolution
+        imagesFull   % blockedImageDatastore at full resolution
+        camerasHalf  % Combined arrayDatastore matching imagesHalf
+        camerasFull  % Combined arrayDatastore matching imagesFull
     end
 
     properties (Constant)
         SH_C0_0          = 0.28209479177387814; % Zeroth-order SH coefficient
-        kScaleDownFactor = 2.0;                 % Downsample factor for image loading
+        kScaleDownFactor = 2.0;                 % Base downsample factor for loading
         kInitialAlpha    = 0.8;                 % Initial Gaussian opacity
     end
 
     methods
-        function obj = ColmapData(dataset_path, max_num_gaussians, max_num_images, ...
-                                   blockSize, miniBatchSize)
+        function obj = ColmapData(dataset_path, max_num_gaussians, max_num_images, blockSize, overlap)
             % Constructor: loads COLMAP data, initialises Gaussians, and
-            % builds the blocked image pipeline.
+            % builds two blockedImageDatastore levels for the resolution schedule.
             %
             % Args:
-            %   dataset_path      (string) : Root directory of the dataset.
-            %   max_num_gaussians (int)    : Maximum number of Gaussians to keep.
-            %   max_num_images    (int)    : Maximum number of training images.
-            %   blockSize         (1x2 int): Tile [H W] in pixels, e.g. [256 256].
-            %                               Must match GaussianSplatter.blockSize.
-            %   miniBatchSize     (int)    : Tiles per mini-batch; sets ReadSize on
-            %                               the datastore and BatchSize on apply().
+            %   dataset_path      (string): Root directory of the dataset.
+            %   max_num_gaussians (int)   : Maximum number of Gaussians to keep.
+            %   max_num_images    (int)   : Maximum number of training images.
+            %   blockSize         (1x2 int): Block [H W] for blockedImage. Default [128 128].
+            %   overlap           (1x2 int): Border [H W] added around each block. Default [0 0].
 
             if nargin < 4 || isempty(blockSize)
-                blockSize = [256, 256];
+                blockSize = [128, 128];
             end
-            if nargin < 5 || isempty(miniBatchSize)
-                miniBatchSize = 2;
+            if nargin < 5 || isempty(overlap)
+                overlap = [0, 0];
             end
-
-            % Full tile size including channel dimension [H W C]
-            pyramidBlockSize = [blockSize(1), blockSize(2), 3];
-
-            % Half-resolution tile target for the coarse training phase
-            halfBlockSize    = [blockSize(1), blockSize(2)];   % imresize target
-            halfPyramidSize  = [blockSize(1), blockSize(2), 3];
+            obj.blockSize = blockSize;
+            obj.overlap   = overlap;
 
             % ------------------------------------------------------------------
             % 1. Load COLMAP Data
@@ -100,6 +90,7 @@ classdef ColmapData < handle
             % ------------------------------------------------------------------
             % 2. Process Metadata (Cameras and File Paths)
             % Pixel data is NOT loaded here — only metadata via imfinfo.
+            % imfinfo is faster than imread for just obtaining dimensions.
             % ------------------------------------------------------------------
             im_keys = sort(cell2mat(keys(ims_map)));
 
@@ -116,12 +107,12 @@ classdef ColmapData < handle
                     continue;
                 end
 
-                % imfinfo avoids a full imread just to get dimensions
+                % Use imfinfo for dimensions only — faster than imread
                 info  = imfinfo(full_im_path);
                 raw_w = info.Width;
                 raw_h = info.Height;
 
-                % Target dimensions after the kScaleDownFactor downscale
+                % Target dimensions after the base kScaleDownFactor downscale
                 w_cur = round(raw_w / obj.kScaleDownFactor);
                 h_cur = round(raw_h / obj.kScaleDownFactor);
 
@@ -136,7 +127,9 @@ classdef ColmapData < handle
                 cam.width  = single(w_cur);
                 cam.height = single(h_cur);
 
-                % Adjust intrinsics to the downscaled resolution
+                % Adjust intrinsics to the full downscaled (whole-image)
+                % resolution. Per-block cx/cy shifting happens later in
+                % buildBlockedLevel(), not here.
                 params = colmap_cam.params;
                 if length(params) >= 4
                     cam.fx = single(params(1) * w_scale);
@@ -174,6 +167,8 @@ classdef ColmapData < handle
             % ------------------------------------------------------------------
             % 4. Limit and Shuffle Data
             % ------------------------------------------------------------------
+
+            % Shuffle Gaussians and keep up to max_num_gaussians
             num_points = size(obj.gaussians.pws, 1);
             p_idx      = randperm(num_points);
             limit_g    = min(num_points, max_num_gaussians);
@@ -193,140 +188,30 @@ classdef ColmapData < handle
             temp_cameras      = temp_cameras(1:limit_img);
 
             % ------------------------------------------------------------------
-            % 5. Build Blocked Image Pipeline
+            % 5. Build Blocked-Image Datastores + Per-Block Cameras
             %
-            % DESIGN: Two separate single-level preprocessed datastores.
+            % Each read() returns one fixed-size block (blockSize + 2*overlap),
+            % not a full image. Camera info is repeated once per block, with
+            % cx/cy shifted to the block's local origin, so combine(images,
+            % cameras) still gives strict 1-to-1 correspondence.
             %
-            % apply() always outputs a single-level blockedImage — multi-level
-            % pyramid output is not preserved through apply(). Therefore the
-            % resolution schedule is implemented as two independent preprocessing
-            % passes, each producing a single-level InMemory blockedImage:
-            %
-            %   Pass A (full resolution):
-            %     - Wrap source files as blockedImage objects.
-            %     - apply(): resize each tile to blockSize + normalise to [0,1].
-            %     - selectBlockLocations() at Level=1 (only valid level).
-            %     - blockedImageDatastore() via BlockLocationSet.
-            %
-            %   Pass B (half resolution):
-            %     - apply(): resize each tile to blockSize/2 + normalise.
-            %     - selectBlockLocations() at Level=1.
-            %     - blockedImageDatastore() via BlockLocationSet.
-            %
-            % obj.images starts pointing to imagesHalf (Pass B).
-            % setLevel(1) swaps obj.images to imagesFull (Pass A).
-            %
-            % InMemory adapter is used for both passes — no disk writes,
-            % no "file already exists" errors, no TIFF overhead.
-            %
-            % selectBlockLocations: 'Levels' must be <= NumLevels of the
-            % input blockedImage. Since apply() output is always single-level,
-            % 'Levels' must always be 1 here.
+            % imagesHalf: kScaleDownFactor*2 — faster early-epoch convergence
+            % imagesFull: kScaleDownFactor   — fine-detail refinement
             % ------------------------------------------------------------------
 
-            fprintf('Building blocked image pipeline...\n');
+            fprintf('Building blocked-image datastores (Half + Full resolution)...\n');
 
-            % Step A1 — Create file-backed blockedImage objects (no pixel I/O)
-            bimArray = blockedImage.empty(0, 1);
-            for k = 1:limit_img
-                bimArray(k) = blockedImage(char(valid_image_paths(k)), ...
-                    'BlockSize', blockSize);    % [H W] — channel dim auto-appended
-            end
+            [obj.imagesHalf, obj.camerasHalf] = obj.buildBlockedLevel( ...
+                valid_image_paths, temp_cameras, obj.kScaleDownFactor * 2.0);
+            [obj.imagesFull, obj.camerasFull] = obj.buildBlockedLevel( ...
+                valid_image_paths, temp_cameras, obj.kScaleDownFactor);
 
-            % ------------------------------------------------------------------
-            % Pass A — Full-resolution preprocessing
-            % Resize each tile to blockSize and normalise uint8 → single [0,1].
-            % im2single handles uint8→single + /255 normalisation in one step.
-            % BatchSize = miniBatchSize saturates the RTX 4050's 2560 CUDA cores.
-            % InMemory adapter: no disk writes, no filename collision errors.
-            % ------------------------------------------------------------------
-            fullPreprocessFcn = @(block) im2single( ...
-                imresize(block.Data, blockSize, 'bilinear'));
-
-            bimFullArray = blockedImage.empty(0, 1);
-            for k = 1:limit_img
-                bimFullArray(k) = apply( ...
-                    bimArray(k), ...
-                    fullPreprocessFcn, ...
-                    'BlockSize',        pyramidBlockSize, ...  % [H W C]
-                    'BatchSize',        miniBatchSize, ...     % GPU tile batching
-                    'PadPartialBlocks', true, ...
-                    'PadMethod',        'symmetric', ...
-                    'Adapter',          images.blocked.InMemory); % RAM only, no disk
-            end
-
-            % selectBlockLocations: apply() output is always single-level so
-            % 'Levels' must be 1. This encodes the block grid into a
-            % blockLocationSet for use by blockedImageDatastore.
-            blsFull = selectBlockLocations(bimFullArray, ...
-                'Levels',    1, ...                % single-level output from apply()
-                'BlockSize', pyramidBlockSize);    % [H W C]
-
-            % blockedImageDatastore.read() returns a cell array of blocks.
-            % transform() unwraps each cell into a plain H×W×C single array so
-            % that combine() can horzcat it cleanly with the numeric camera datastores.
-            bimdsRaw = blockedImageDatastore(bimFullArray, ...
-                'BlockLocationSet', blsFull, ...
-                'PadPartialBlocks', true, ...
-                'PadMethod',        'symmetric', ...
-                'ReadSize',         miniBatchSize);
-            obj.imagesFull = transform(bimdsRaw, @ColmapData.unwrapBlockCell);
+            % Start at half resolution
+            obj.images  = obj.imagesHalf;
+            obj.cameras = obj.camerasHalf;
 
             % ------------------------------------------------------------------
-            % Pass B — Half-resolution preprocessing
-            % Resize each tile to half of blockSize for fast early convergence.
-            % Training starts with this datastore (coarser = faster iterations).
-            % Same InMemory + single-level pattern as Pass A.
-            % ------------------------------------------------------------------
-            halfPreprocessFcn = @(block) im2single( ...
-                imresize(block.Data, halfBlockSize / 2, 'bilinear'));
-
-            bimHalfArray = blockedImage.empty(0, 1);
-            for k = 1:limit_img
-                bimHalfArray(k) = apply( ...
-                    bimArray(k), ...
-                    halfPreprocessFcn, ...
-                    'BlockSize',        halfPyramidSize, ...   % [H W C]
-                    'BatchSize',        miniBatchSize, ...
-                    'PadPartialBlocks', true, ...
-                    'PadMethod',        'symmetric', ...
-                    'Adapter',          images.blocked.InMemory);
-            end
-
-            blsHalf = selectBlockLocations(bimHalfArray, ...
-                'Levels',    1, ...                % single-level output from apply()
-                'BlockSize', halfPyramidSize);     % [H W C]
-
-            bimdsRawHalf = blockedImageDatastore(bimHalfArray, ...
-                'BlockLocationSet', blsHalf, ...
-                'PadPartialBlocks', true, ...
-                'PadMethod',        'symmetric', ...
-                'ReadSize',         miniBatchSize);
-            obj.imagesHalf = transform(bimdsRawHalf, @ColmapData.unwrapBlockCell);
-
-            % Start training at half resolution for fast early convergence.
-            % Call obj.setLevel(1) at levelSwitchEpoch to swap to full res.
-            obj.images = obj.imagesHalf;
-
-            % ------------------------------------------------------------------
-            % 6. Build Camera Label Datastores
-            % arrayDatastore provides efficient random-access shuffling of
-            % camera parameters combined with the image tile datastore.
-            % ------------------------------------------------------------------
-            obj.cameras = combine( ...
-                arrayDatastore([temp_cameras.id],                         'IterationDimension', 2), ...
-                arrayDatastore([temp_cameras.width],                      'IterationDimension', 2), ...
-                arrayDatastore([temp_cameras.height],                     'IterationDimension', 2), ...
-                arrayDatastore([temp_cameras.fx],                         'IterationDimension', 2), ...
-                arrayDatastore([temp_cameras.fy],                         'IterationDimension', 2), ...
-                arrayDatastore([temp_cameras.cx],                         'IterationDimension', 2), ...
-                arrayDatastore([temp_cameras.cy],                         'IterationDimension', 2), ...
-                arrayDatastore(reshape([temp_cameras.Rcw], 3, 3, []),     'IterationDimension', 3), ...
-                arrayDatastore(reshape([temp_cameras.tcw], 3, 1, []),     'IterationDimension', 3), ...
-                arrayDatastore(reshape([temp_cameras.twc], 3, 1, []),     'IterationDimension', 3));
-
-            % ------------------------------------------------------------------
-            % 7. Find Scene Scale
+            % 6. Find Scene Scale
             % ------------------------------------------------------------------
             obj.scene_scale = arrayDatastore( ...
                 ColmapData.findSceneScale(temp_cameras), 'IterationDimension', 2);
@@ -335,31 +220,129 @@ classdef ColmapData < handle
         end
 
         function setLevel(obj, level)
-            % Switch the active blockedImageDatastore to a different resolution.
+            % Switch the active image+camera datastores to a different resolution.
             %
-            % Because apply() always produces single-level blockedImage output,
-            % two separate datastores are pre-built at construction time.
-            % setLevel swaps obj.images between them — no data is re-loaded.
+            % Block layout differs per resolution level, so the per-block
+            % camera offsets differ too — images and cameras must be swapped
+            % together. After calling setLevel, the caller must also call
+            % obj.updateResolution() in GaussianSplatter to reallocate GPU
+            % buffers to the new block canvas size.
             %
             % Args:
-            %   level (int): 1 = full resolution (imagesFull)
-            %                2 = half resolution (imagesHalf)
+            %   level (int): 1 = full resolution  (imagesFull/camerasFull)
+            %                2 = half resolution  (imagesHalf/camerasHalf)
             %
             % Usage (in trainGaussianSplat.m):
             %   if epoch == levelSwitchEpoch
             %       obj.data.setLevel(1);
+            %       obj.updateResolution();
             %   end
 
             if level == 1
-                obj.images = obj.imagesFull;
-                fprintf('Switched to full-resolution blockedImageDatastore.\n');
+                obj.images  = obj.imagesFull;
+                obj.cameras = obj.camerasFull;
+                fprintf('Switched to full-resolution datastore.\n');
             elseif level == 2
-                obj.images = obj.imagesHalf;
-                fprintf('Switched to half-resolution blockedImageDatastore.\n');
+                obj.images  = obj.imagesHalf;
+                obj.cameras = obj.camerasHalf;
+                fprintf('Switched to half-resolution datastore.\n');
             else
                 error('ColmapData:setLevel', ...
                     'Invalid level %d. Use 1 (full res) or 2 (half res).', level);
             end
+        end
+
+        function [bimds, camDS] = buildBlockedLevel(obj, imagePaths, cams, scaleDownFactor)
+            % Build an in-memory blockedImageDatastore for one resolution
+            % level, plus a matching combined arrayDatastore that repeats
+            % each image's camera entry once per block (cx/cy shifted to
+            % the block's local pixel origin).
+            %
+            % Args:
+            %   imagePaths      (Nx1 string): Paths, 1-to-1 with cams.
+            %   cams            (Nx1 struct): Per-image camera metadata.
+            %   scaleDownFactor (double)    : Reciprocal resize factor for
+            %                                 this resolution level.
+
+            numImgs = numel(imagePaths);
+            bims = [];
+            for k = 1:numImgs
+                img = ColmapData.preprocessImage(imread(imagePaths(k)), scaleDownFactor);
+                b   = blockedImage(img, 'BlockSize', obj.blockSize);
+                if isempty(bims)
+                    bims = b;
+                else
+                    bims(end+1) = b; %#ok<AGROW>
+                end
+            end
+
+            % Unlike BlockSize, BorderSize must match the blocked image's full
+            % dimensionality exactly (H,W,C) — pad with 0 for the channel dim.
+            borderSize = [obj.overlap, zeros(1, bims(1).NumDimensions - numel(obj.overlap))];
+
+            bimds = blockedImageDatastore(bims, 'BlockSize', obj.blockSize, ...
+                'BorderSize', borderSize, 'PadPartialBlocks', true, 'PadMethod', 0);
+
+            % Auto-generated block layout, in the exact order read() returns blocks.
+            bls       = bimds.BlockLocationSet;
+            numBlocks = size(bls.BlockOrigin, 1);
+
+            blockH = obj.blockSize(1) + 2 * obj.overlap(1);
+            blockW = obj.blockSize(2) + 2 * obj.overlap(2);
+
+            blockCams = repmat(struct('id', single(0), 'blockId', single(0), ...
+                'blockRow', single(0), 'blockCol', single(0), ...
+                'width', single(0), 'height', single(0), 'fx', single(0), ...
+                'fy', single(0), 'cx', single(0), 'cy', single(0), ...
+                'Rcw', single(zeros(3,3)), 'tcw', single(zeros(3,1)), ...
+                'twc', single(zeros(3,1))), numBlocks, 1);
+
+            for k = 1:numBlocks
+                imgIdx = bls.ImageNumber(k);
+                cam    = cams(imgIdx);
+
+                % BlockOrigin columns are (x,y[,channel]); world2sub expects
+                % (row,col[,channel]) order, so swap only the first two
+                % columns — fliplr of an n×3 row would scramble row/col/channel.
+                worldOrd = bls.BlockOrigin(k, :);
+                worldOrd(1:2) = worldOrd([2 1]);
+                originRC  = world2sub(bims(imgIdx), worldOrd);
+                rowOffset = originRC(1) - 1 - obj.overlap(1);
+                colOffset = originRC(2) - 1 - obj.overlap(2);
+
+                % 1-based tile position of this block within its source
+                % image's grid — used to stitch blocks back together for
+                % preview/visualization (grid spacing == blockSize).
+                blockCams(k).blockRow = single(round((originRC(1) - 1) / obj.blockSize(1)) + 1);
+                blockCams(k).blockCol = single(round((originRC(2) - 1) / obj.blockSize(2)) + 1);
+
+                blockCams(k).id      = cam.id;
+                blockCams(k).blockId = single(k);
+                blockCams(k).width   = single(blockW);
+                blockCams(k).height  = single(blockH);
+                blockCams(k).fx      = cam.fx;
+                blockCams(k).fy      = cam.fy;
+                blockCams(k).cx      = cam.cx - single(colOffset);
+                blockCams(k).cy      = cam.cy - single(rowOffset);
+                blockCams(k).Rcw     = cam.Rcw;
+                blockCams(k).tcw     = cam.tcw;
+                blockCams(k).twc     = cam.twc;
+            end
+
+            camDS = combine( ...
+                arrayDatastore([blockCams.id],                          'IterationDimension', 2), ...
+                arrayDatastore([blockCams.blockId],                     'IterationDimension', 2), ...
+                arrayDatastore([blockCams.blockRow],                    'IterationDimension', 2), ...
+                arrayDatastore([blockCams.blockCol],                    'IterationDimension', 2), ...
+                arrayDatastore([blockCams.width],                       'IterationDimension', 2), ...
+                arrayDatastore([blockCams.height],                      'IterationDimension', 2), ...
+                arrayDatastore([blockCams.fx],                          'IterationDimension', 2), ...
+                arrayDatastore([blockCams.fy],                          'IterationDimension', 2), ...
+                arrayDatastore([blockCams.cx],                          'IterationDimension', 2), ...
+                arrayDatastore([blockCams.cy],                          'IterationDimension', 2), ...
+                arrayDatastore(reshape([blockCams.Rcw], 3, 3, []),      'IterationDimension', 3), ...
+                arrayDatastore(reshape([blockCams.tcw], 3, 1, []),      'IterationDimension', 3), ...
+                arrayDatastore(reshape([blockCams.twc], 3, 1, []),      'IterationDimension', 3));
         end
 
         function g = initGaussiansFrom3dPoints(obj, pts)
@@ -378,8 +361,11 @@ classdef ColmapData < handle
             rgb   = [[pts.r]', [pts.g]', [pts.b]'];
             g.shs = ((double(rgb) / 255.0) - 0.5) / obj.SH_C0_0;
 
-            % Initial rotation: identity quaternion [w x y z] = [0 0 0 1]
-            g.rots = repmat([0, 0, 0, 1], num_pts, 1);
+            % Initial rotation: identity quaternion [w x y z] = [1 0 0 0]
+            % Convention: column 1 = w, columns 2-4 = x,y,z, matching qVec2RotMat
+            % and projectGaussiansWithCulling in GaussianSplatter.m.
+            % [0,0,0,1] is a 180° rotation around Z (R11=R22=-1) — NOT identity.
+            g.rots = repmat([1, 0, 0, 0], num_pts, 1);
 
             % Initial opacity
             g.alphas = repmat(obj.kInitialAlpha, num_pts, 1);
@@ -391,6 +377,27 @@ classdef ColmapData < handle
     end
 
     methods (Static)
+        function imgOut = preprocessImage(imgIn, scaleDownFactor)
+            % Full-image preprocessing: resize then normalise to [0, 1].
+            % Applied via transform() so images are loaded lazily on demand.
+            %
+            % Args:
+            %   imgIn         : Single image (H×W×C uint8) or cell wrapping one.
+            %   scaleDownFactor: Reciprocal of the resize scale factor.
+            %                   kScaleDownFactor   → full training resolution
+            %                   kScaleDownFactor*2 → half training resolution
+
+            if iscell(imgIn)
+                imgIn = imgIn{1};
+            end
+            % imresize with 1/scaleDownFactor gives the target resolution.
+            % 'bilinear' matches the apply() method used in the blocked path.
+            imgResized = imresize(imgIn, 1.0 / scaleDownFactor, 'bilinear');
+
+            % im2single: uint8 → single and divides by 255 (normalises to [0,1])
+            imgOut = im2single(imgResized);
+        end
+
         function scale = findSceneScale(cameras)
             % Compute scene scale as 1.1× the maximum camera-centre spread.
             if isempty(cameras)
@@ -410,21 +417,6 @@ classdef ColmapData < handle
             R(1,1) = 1 - 2*y^2 - 2*z^2;  R(1,2) = 2*x*y - 2*w*z;      R(1,3) = 2*x*z + 2*w*y;
             R(2,1) = 2*x*y + 2*w*z;       R(2,2) = 1 - 2*x^2 - 2*z^2;  R(2,3) = 2*y*z - 2*w*x;
             R(3,1) = 2*x*z - 2*w*y;       R(3,2) = 2*y*z + 2*w*x;      R(3,3) = 1 - 2*x^2 - 2*y^2;
-        end
-
-        function imgOut = unwrapBlockCell(data)
-            % blockedImageDatastore returns a cell array of H×W×C blocks.
-            % This transform unwraps a single-element cell into a plain
-            % H×W×C single array compatible with combine() and minibatchqueue.
-            if iscell(data)
-                imgOut = data{1};
-            else
-                imgOut = data;
-            end
-            % Ensure single precision for GPU transfer
-            if ~isa(imgOut, 'single')
-                imgOut = im2single(imgOut);
-            end
         end
     end
 end
