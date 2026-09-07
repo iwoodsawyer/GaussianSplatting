@@ -87,6 +87,10 @@ classdef GaussianSplatter < handle
         % Default: auto-selected based on GPU compute capability.
         blockSize = [];  % Will be auto-selected in constructor if not provided
 
+        % Gaussians composited per vectorized chunk in rasterizeToGPU.
+        % Larger = fewer kernel launches but more [H'×W'×K] temp memory.
+        chunkSize = 64;
+
         % --- Data ---
         datasetPath
         data
@@ -511,33 +515,29 @@ classdef GaussianSplatter < handle
             end
         end
 
-        function rasterizeToGPU(this, numValid)
-            % GPU rasterization with pre-built tile lists.
+        function rasterizeToGPU(this, numValid) %#ok<INUSD>
+            % Chunked, vectorized alpha compositing per tile.
             %
-            % Input: this.tileList — cell array pre-computed by buildTileList()
-            %        tileList{b}{th, tw} = [indices of Gaussians in tile
-            %        (th, tw) of batch element b]
+            % Painter's algorithm reformulated without a serial per-Gaussian
+            % dependency:  C(p) = sum_k c_k*alpha_k(p)*prod_{j<k}(1-alpha_j(p))
             %
-            % NO extractdata() in this loop — all indexing is CPU-based and
-            % pre-computed. Gaussians are processed purely on GPU with no sync.
-            %
-            % For each tile:
-            %   1. Fetch its pre-built Gaussian list from tileList{th, tw}
-            %   2. For each Gaussian k in the list:
-            %      - Compute pixel offsets using separable 1-D coordinates
-            %      - Compute Mahalanobis distance
-            %      - Clamp alpha to available transmittance (numerically stable)
-            %      - Composite with fused 3-D color broadcast
-            %      - Update transmittance
-            %   3. Early termination if tile is fully opaque
+            % Depth-sorted Gaussians are processed in chunks of chunkSize:
+            %   1. Alpha maps for the whole chunk in one fused broadcast
+            %      [H' x W' x K] — one set of kernel launches per chunk
+            %      instead of per Gaussian.
+            %   2. Within-chunk transmittance via cumprod along dim 3,
+            %      detached from autodiff (extractdata) — same gradient
+            %      semantics as the previous per-Gaussian version, which
+            %      also excluded T from the tape.
+            %   3. Tile output accumulated in local accR/accG/accB and
+            %      written to this.image ONCE per tile, avoiding repeated
+            %      dlarray copy-on-write subscripted assignments.
 
             blockH = this.blockSize(1);
             blockW = this.blockSize(2);
+            K      = this.chunkSize;
 
             for b = 1:this.miniBatchSize
-                % Reset transmittance to 1 (fully transparent) for each image
-                this.T(:) = 1;
-
                 % Tile lists for this batch element's block/camera view
                 tiles = this.tileList{b};
 
@@ -546,77 +546,68 @@ classdef GaussianSplatter < handle
                     tileVmax = min(th * blockH, this.imageHeight);
 
                     for tw = 1:size(tiles, 2)
-                        tileUmin = (tw - 1) * blockW + 1;
-                        tileUmax = min(tw * blockW, this.imageWidth);
-
-                        % Pre-built Gaussian list for this tile (computed by buildTileList)
                         gaussianList = tiles{th, tw};
                         if isempty(gaussianList)
                             continue;
                         end
 
-                        % Rasterize all Gaussians in this tile
-                        for i_idx = 1:length(gaussianList)
-                            k = gaussianList(i_idx);
+                        tileUmin = (tw - 1) * blockW + 1;
+                        tileUmax = min(tw * blockW, this.imageWidth);
 
-                            % Fetch projection results from persistent buffers
-                            u_k = this.u_buffer(k, 1, 1, b);
-                            v_k = this.v_buffer(k, 1, 1, b);
+                        x_t = this.X_vec(tileUmin:tileUmax);  % [1 x W']
+                        y_t = this.Y_vec(tileVmin:tileVmax);  % [H' x 1]
 
-                            % Clipped pixel bounds from the CPU bbox cache —
-                            % avoids a per-Gaussian GPU→CPU sync (extractdata)
-                            umin_ki = uint32(max(single(tileUmin), this.uminCPU(k, b)));
-                            umax_ki = uint32(min(single(tileUmax), this.umaxCPU(k, b)));
-                            vmin_ki = uint32(max(single(tileVmin), this.vminCPU(k, b)));
-                            vmax_ki = uint32(min(single(tileVmax), this.vmaxCPU(k, b)));
+                        % Tile-local transmittance carried across chunks
+                        T_tile = ones(numel(y_t), numel(x_t), 'single', 'gpuArray');
 
-                            % Validate tile bounds
-                            if umin_ki > umax_ki || vmin_ki > vmax_ki
-                                continue;
-                            end
+                        accR = single(0);
+                        accG = single(0);
+                        accB = single(0);
 
-                            % Pixel offsets from Gaussian centre using separable 1-D coords
-                            % Fetch 1-D vectors and compute offsets
-                            dx_1d = this.X_vec(umin_ki:umax_ki) - u_k;  % [1 x W']
-                            dy_1d = this.Y_vec(vmin_ki:vmax_ki) - v_k;  % [H' x 1]
+                        numG = numel(gaussianList);
+                        for c0 = 1:K:numG
+                            idx = gaussianList(c0:min(c0 + K - 1, numG));
 
-                            % Standard 3DGS Mahalanobis falloff (GPU-native)
-                            s11 = this.Sigma2D_inv_buffer(k, 1, 1, b);
-                            s12 = this.Sigma2D_inv_buffer(k, 1, 2, b);
-                            s22 = this.Sigma2D_inv_buffer(k, 2, 2, b);
+                            % Chunk parameters as [1 x 1 x K] for broadcasting
+                            u_c = reshape(stripdims(this.u_buffer(idx, 1, 1, b)), 1, 1, []);
+                            v_c = reshape(stripdims(this.v_buffer(idx, 1, 1, b)), 1, 1, []);
+                            a_c = reshape(stripdims(this.alphas_buffer(idx, 1, 1, b)), 1, 1, []);
+                            s11 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 1, b)), 1, 1, []);
+                            s12 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 2, b)), 1, 1, []);
+                            s22 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 2, 2, b)), 1, 1, []);
 
-                            % Fused Mahalanobis distance computation
-                            alphaT = stripdims(s11 .* (dx_1d.^2) + ...
-                                   single(2.0) .* s12 .* (dy_1d .* dx_1d) + ...
-                                   s22 .* (dy_1d.^2));
+                            dx = x_t - u_c;  % [1  x W' x K]
+                            dy = y_t - v_c;  % [H' x 1  x K]
 
-                            % Fused alpha computation: exp(-0.5*maha) * base_alpha
-                            alphaT = exp(-single(0.5) .* alphaT);
-                            alphaT = this.alphas_buffer(k, 1, 1, b) .* alphaT;
+                            % Fused Mahalanobis falloff for the whole chunk
+                            alpha = a_c .* exp(single(-0.5) .* ...
+                                (s11 .* dx.^2 + single(2.0) .* s12 .* (dy .* dx) + ...
+                                 s22 .* dy.^2));  % [H' x W' x K]
 
-                            % Painter's algorithm: modulate by accumulated transmittance
-                            alphaT = this.T(vmin_ki:vmax_ki, umin_ki:umax_ki, 1) .* alphaT;
+                            % Transmittance is detached from autodiff (as before);
+                            % Tprev(:,:,k) = T before compositing chunk-Gaussian k
+                            alpha_nd = extractdata(alpha);
+                            Tk    = cumprod(single(1.0) - alpha_nd, 3);
+                            Tprev = cat(3, T_tile, T_tile .* Tk(:, :, 1:end-1));
 
-                            % Alpha-composite into the rendered image with fused 3-D color broadcast
-                            % Reshape color to [1 1 3] so it broadcasts across spatial dims
-                            c_patch = reshape(this.colors_buffer(k, 1, :, b), 1, 1, 3);
-                            this.image(vmin_ki:vmax_ki, umin_ki:umax_ki, :, b) = ...
-                                this.image(vmin_ki:vmax_ki, umin_ki:umax_ki, :, b) + ...
-                                alphaT .* c_patch;
+                            w = alpha .* Tprev;  % dlarray composite weights
 
-                            % Update transmittance
-                            this.T(vmin_ki:vmax_ki, umin_ki:umax_ki, 1) = ...
-                                this.T(vmin_ki:vmax_ki, umin_ki:umax_ki, 1) - extractdata(alphaT);
+                            cR = reshape(stripdims(this.colors_buffer(idx, 1, 1, b)), 1, 1, []);
+                            cG = reshape(stripdims(this.colors_buffer(idx, 1, 2, b)), 1, 1, []);
+                            cB = reshape(stripdims(this.colors_buffer(idx, 1, 3, b)), 1, 1, []);
 
-                            % Per-tile early termination: stop once this tile
-                            % is fully opaque (transmittance < 0.01)
-                            % if max(this.T(tileVmin:tileVmax, tileUmin:tileUmax), [], 'all') < 1e-2
-                            %     break;
-                            % end
+                            accR = accR + sum(w .* cR, 3);
+                            accG = accG + sum(w .* cG, 3);
+                            accB = accB + sum(w .* cB, 3);
+
+                            T_tile = T_tile .* Tk(:, :, end);
                         end
+
+                        % Single write per tile (tiles are disjoint, image pre-zeroed)
+                        this.image(tileVmin:tileVmax, tileUmin:tileUmax, :, b) = ...
+                            cat(3, accR, accG, accB);
                     end
                 end
-                
             end
         end
 
