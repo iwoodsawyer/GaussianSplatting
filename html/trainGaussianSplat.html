@@ -9,7 +9,7 @@ To make changes, update the MATLAB code and republish this document.
 <title>Train 3D Gaussian Splatting (3DGS)</title>
 <meta name="generator" content="MATLAB 25.2">
 <link rel="schema.DC" href="http://purl.org/dc/elements/1.1/">
-<meta name="DC.date" content="2026-02-01">
+<meta name="DC.date" content="2026-09-07">
 <meta name="DC.source" content="trainGaussianSplat.m">
 <style type="text/css">
 html,body,div,span,applet,object,iframe,h1,h2,h3,h4,h5,h6,p,blockquote,pre,a,abbr,acronym,address,big,cite,code,del,dfn,em,font,img,ins,kbd,q,s,samp,small,strike,strong,tt,var,b,u,i,center,dl,dt,dd,ol,ul,li,fieldset,form,label,legend,table,caption,tbody,tfoot,thead,tr,th,td{margin:0;padding:0;border:0;outline:0;font-size:100%;vertical-align:baseline;background:transparent}body{line-height:1}ol,ul{list-style:none}blockquote,q{quotes:none}blockquote:before,blockquote:after,q:before,q:after{content:'';content:none}:focus{outine:0}ins{text-decoration:none}del{text-decoration:line-through}table{border-collapse:collapse;border-spacing:0}
@@ -79,6 +79,10 @@ table td { padding:7px 5px; text-align:left; vertical-align:top; border:1px soli
 <h1>Train 3D Gaussian Splatting (3DGS)</h1>
 <!--introduction-->
 <p>This example shows how-to train and generate 2D images using a minimal implementation of 3D Gaussian splatting.</p>
+<p>GPU Target: NVIDIA RTX 4050 Laptop GPU - 6 GB GDDR6 VRAM - 192 GB/s memory bandwidth - 2560 CUDA cores (Ada Lovelace)</p>
+<p>Image Loading Design: Images are loaded as a blockedImageDatastore (ColmapData.images); each read() returns one fixed-size block (blockSize + 2*overlap), not a full image. Camera info is repeated once per block with cx/cy shifted to the block's local origin, so combine(obj.data.images, obj.data.cameras) still gives strict 1-to-1 correspondence. blockSize defaults to GaussianSplatter.autoSelectBlockSize(), which picks the size (per dimension, in [64, 160]) that minimizes total partial-block zero-padding summed over both resolution levels.</p>
+<p>GPU-Vectorized Rendering: Rasterization no longer loops per-Gaussian or per-batch-element: - projectGaussiansWithCulling processes all Gaussians x all blocks in the batch as [N x B] arrays in one pass (camera transform, projection, Sigma_2D via an elementwise J*Sigma*J^T, depth sort), scattering results into persistent buffers by pure indexing. - rasterizeToGPU composites depth-sorted Gaussians in vectorized chunks per tile (fused [H' x W' x K] alpha maps, cumprod transmittance, one image write per tile), with a per-chunk (not per-Gaussian) early-termination check once a tile saturates. Because the L1/SSIM loss is computed directly on this.image/this.image_gt (now block-sized), the loss is automatically scoped to the block instead of the full image &mdash; increasing miniBatchSize below now simply increases the number of blocks processed per training step.</p>
+<p>Multi-Resolution Schedule: Training starts at half resolution (fast early convergence). At levelSwitchEpoch: setLevel(1) swaps both the image and camera datastores (block layout differs per resolution), then updateResolution() reallocates GPU buffers to the new block canvas size. Without updateResolution(), GPU buffers stay at half-res dimensions.</p>
 <!--/introduction-->
 <h2>Contents</h2>
 <div>
@@ -87,178 +91,453 @@ table td { padding:7px 5px; text-align:left; vertical-align:top; border:1px soli
 <a href="#1">Load Data</a>
 </li>
 <li>
-<a href="#2">Define Learnable Parameters</a>
+<a href="#2">Blocked Image / Tile Settings</a>
 </li>
 <li>
-<a href="#3">Specify Training Options</a>
+<a href="#3">Define Learnable Parameters</a>
 </li>
 <li>
-<a href="#5">Train Model</a>
+<a href="#4">Specify Training Options</a>
 </li>
 <li>
-<a href="#14">Preview Results</a>
+<a href="#5">Multi-Resolution Schedule</a>
+</li>
+<li>
+<a href="#6">Train Model</a>
+</li>
+<li>
+<a href="#7">Create minibatchqueue</a>
+</li>
+<li>
+<a href="#8">Adaptive Densification Settings</a>
+</li>
+<li>
+<a href="#9">Initialize Adam Optimizer State</a>
+</li>
+<li>
+<a href="#10">Training Progress Bookkeeping</a>
+</li>
+<li>
+<a href="#11">Initialize Preview Render Index</a>
+</li>
+<li>
+<a href="#12">Custom Training Loop</a>
+</li>
+<li>
+<a href="#13">Preview Results</a>
 </li>
 </ul>
 </div>
 <h2 id="1">Load Data</h2>
-<p>Specify the folder containing the SFM generated sparse 3d pointcloud as input, generated in COLMAP format. Download example dataset from <a href="https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip">https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip</a>.</p>
+<p>Specify the folder containing the SFM generated sparse 3D point cloud as input, generated in COLMAP format. Download example dataset from: <a href="https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip">https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip</a>
+</p>
 <pre class="codeinput">datasetPath  = <span class="string">'C:\Source\tandt_db\tandt\train'</span>; <span class="comment">% Update this path</span>
-numGaussians = 2000; <span class="comment">% more gaussians creates sharper images, but needs more memory and has longer training time</span>
+numGaussians = 2000; <span class="comment">% More Gaussians creates sharper images, but needs more</span>
+                     <span class="comment">% memory and has longer training time.</span>
 numImages    = 20;
 </pre>
-<h2 id="2">Define Learnable Parameters</h2>
-<p>Construct object and to load data and create learnable parameters</p>
-<pre class="codeinput">obj = GaussianSplatter(datasetPath, numGaussians, numImages);
+<h2 id="2">Blocked Image / Tile Settings</h2>
+<p>Block/tile size used both by ColmapData's blockedImageDatastore (dataset block grid) and by GaussianSplatter.createImage's internal tile-culling loop. overlapSize adds a context halo (BorderSize) around each block; it does NOT change the block grid, so it has no effect on padding &mdash; only blockSize does.</p>
+<p>Leaving blockSize empty lets GaussianSplatter.autoSelectBlockSize() pick the size (per dimension, in [64, 160]) that minimizes total partial-block zero-padding summed over both resolution levels.</p>
+<pre class="codeinput">blockSize   = [];
+overlapSize = [8, 8];
 </pre>
-<pre class="codeoutput">Loading COLMAP data from C:\Source\tandt_db\tandt\train\sparse\0...
+<h2 id="3">Define Learnable Parameters</h2>
+<p>Construct object to load data and create learnable parameters.</p>
+<pre class="codeinput">obj = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize, overlapSize);
+</pre>
+<pre class="codeoutput">Auto-selected block size: [137 123] (full canvas 273x490, half 137x245)
+GaussianSplatter running in GPU mode.
+Loading COLMAP data from C:\Source\tandt_db\tandt\train\sparse\0...
 Loading cameras...
 Loading images...
 Loading 3D points...
 Loaded: 1 cameras, 301 images, 182686 points3D
 Processing metadata...
 Initializing Gaussians...
+Building blocked-image datastores (Half + Full resolution)...
+ColmapData initialisation complete.
 </pre>
-<h2 id="3">Specify Training Options</h2>
-<p>Train for 50 epochs with a mini-batch size of 1.</p>
-<pre class="codeinput">miniBatchSize = 2;
-numEpochs     = ceil(numGaussians/20);
-</pre>
-<p>Specify the options for Adam optimization:</p>
-<pre class="codeinput">learnRate     = 0.02;
-learnInterval = ceil(numEpochs/5);
-gradDecay     = 1 - miniBatchSize/numImages;
+<h2 id="4">Specify Training Options</h2>
+<p>miniBatchSize now counts BLOCKS (not full images) per training step &mdash; raise it to increase the number of blocked images processed per batch.</p>
+<pre class="codeinput">totalNumBlocks = obj.data.images.TotalNumBlocks;
+miniBatchSize = 2*totalNumBlocks/numImages;
+numEpochs     = ceil(numGaussians / 20);
+
+<span class="comment">% Adam optimization options</span>
+learnRate     = 0.02;
+learnInterval = ceil(numEpochs / 5);
+gradDecay     = 1 - miniBatchSize / totalNumBlocks;
 sqGradDecay   = 0.999;
 </pre>
-<h2 id="5">Train Model</h2>
-<p>Train the 3D Gaussian splat model using a custom training loop.</p>
-<p>Training the model is a computationally expensive process that can take hours. To save time while running this example, load a pretrained network by setting doTraining to false. To train the network yourself, set doTraining to true.</p>
+<h2 id="5">Multi-Resolution Schedule</h2>
+<p>Switch from half-resolution to full resolution at 30% of total epochs. After setLevel(1), updateResolution() must be called to reallocate GPU buffers (image, X, Y, T) to the new canvas dimensions. Without this, buffers remain at half-resolution, clipping Gaussian projections.</p>
+<pre class="codeinput">levelSwitchEpoch = max(1, floor(numEpochs * 0.3));
+</pre>
+<h2 id="6">Train Model</h2>
+<p>To save time, load a pretrained network by setting doTraining to false. To train the network yourself, set doTraining to true.</p>
 <pre class="codeinput">doTraining = true;
 </pre>
-<p>Create a minibatchqueue object that processes and manages mini-batches of images and camera data during training.</p>
-<pre class="codeinput">ds = combine(obj.data.images, obj.data.cameras); <span class="comment">% Combined datastore</span>
-mbq = minibatchqueue(ds,<span class="string">'MiniBatchSize'</span>,miniBatchSize, <span class="keyword">...</span>
-    <span class="string">'PartialMiniBatch'</span>,<span class="string">'discard'</span>,<span class="string">'OutputEnvironment'</span>,<span class="string">'auto'</span>,<span class="keyword">...</span>
-    <span class="string">'MiniBatchFor'</span>,[<span class="string">"SSCB"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"B"</span>,<span class="string">"SSB"</span>,<span class="string">"SB"</span>,<span class="string">"SB"</span>]);
+<h2 id="7">Create minibatchqueue</h2>
+<p>combine() merges the blocked-image datastore with the per-block camera arrayDatastores. 1-to-1 correspondence is guaranteed because ColmapData repeats/offsets one camera entry per block, matching blockedImageDatastore's read order.</p>
+<p>OutputEnvironment='gpu' transfers each block directly to GPU VRAM on the RTX 4050, bypassing a redundant CPU staging copy.</p>
+<p>MiniBatchFormat: Image: 'SSCB' (H &times; W &times; Channel &times; Batch) Camera scalars: 'CB' (1 &times; Batch &mdash; arrayDatastore adds leading dim) Rcw rotation: 'SSCB' (3 &times; 3 &times; 1 &times; Batch) tcw, twc vectors: 'SCB' (3 &times; 1 &times; Batch)</p>
+<pre class="codeinput">ds = combine(obj.data.images, obj.data.cameras);
+mbq = minibatchqueue(ds, <span class="keyword">...</span>
+    <span class="string">'MiniBatchSize'</span>,    miniBatchSize, <span class="keyword">...</span>
+    <span class="string">'PartialMiniBatch'</span>, <span class="string">'discard'</span>, <span class="keyword">...</span>
+    <span class="string">'OutputEnvironment'</span>,GaussianSplatter.outEnv(obj.useGPU), <span class="keyword">...</span>
+    <span class="string">'MiniBatchFormat'</span>,  [<span class="string">"SSCB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"SSCB"</span>,<span class="string">"SCB"</span>,<span class="string">"SCB"</span>]);
 </pre>
-<p>Adaptive densification</p>
+<h2 id="8">Adaptive Densification Settings</h2>
 <pre class="codeinput">enableAdaptiveDensification = true;
-densifyInterval = ceil(numEpochs/25);
-prunningRatio = 0.05;
+densifyInterval = ceil(numEpochs / 25);
+prunningRatio   = 0.05;
 </pre>
-<p>Initialize the parameters for Adam optimization.</p>
-<pre class="codeinput">avgGrad = [];
+<h2 id="9">Initialize Adam Optimizer State</h2>
+<pre class="codeinput">avgGrad   = [];
 avgSqGrad = [];
 </pre>
-<p>Calculate the total number of iterations for the training progress monitor</p>
-<pre class="codeinput">numIterationsPerEpoch = ceil(numImages/miniBatchSize);
-numIterations = numEpochs * numIterationsPerEpoch;
-</pre>
-<p>Initialize the training progress monitor</p>
-<pre class="codeinput">
+<h2 id="10">Training Progress Bookkeeping</h2>
+<pre class="codeinput">numIterationsPerEpoch = ceil(totalNumBlocks / miniBatchSize);
+numIterations         = numEpochs * numIterationsPerEpoch;
+
 <span class="keyword">if</span> doTraining
-    monitor = trainingProgressMonitor(<span class="string">'Metrics'</span>,<span class="string">"Loss"</span>,<span class="string">'Info'</span>,<span class="string">"Epoch"</span>,<span class="string">'XLabel'</span>,<span class="string">"Iteration"</span>);
+    monitor = trainingProgressMonitor( <span class="keyword">...</span>
+        <span class="string">'Metrics'</span>, <span class="string">"Loss"</span>, <span class="keyword">...</span>
+        <span class="string">'Info'</span>,    <span class="string">"Epoch"</span>, <span class="keyword">...</span>
+        <span class="string">'XLabel'</span>,  <span class="string">"Iteration"</span>);
 <span class="keyword">end</span>
 </pre>
-<img vspace="5" hspace="5" src="trainGaussianSplat_01.png" alt=""> <p>Initialize the preview render</p>
-<pre class="codeinput">imageIdxToShow = preview(obj.data.cameras);
-imageIdxToShow = imageIdxToShow{1};
+<img vspace="5" hspace="5" src="trainGaussianSplat_01.png" alt=""> <h2 id="11">Initialize Preview Render Index</h2>
+<p>Lock onto a single, unique blockId (not the reused source-image id) so the live preview always shows the same physical block across epochs.</p>
+<pre class="codeinput">blockIdxToShow = 1;
 </pre>
-<p>Train the model using a custom training loop. For each epoch, shuffle the images and camera data and loop over mini-batches. At the end of each iteration, display the training progress.</p>
+<h2 id="12">Custom Training Loop</h2>
 <pre class="codeinput">
 <span class="keyword">if</span> doTraining
     iteration = 0;
-    epoch = 0;
+    epoch     = 0;
+
     <span class="keyword">while</span> epoch &lt; numEpochs &amp;&amp; ~monitor.Stop
         epoch = epoch + 1;
 
-        <span class="comment">% Shuffle data</span>
+        <span class="comment">% -----------------------------------------------------------------</span>
+        <span class="comment">% Multi-resolution schedule.</span>
+        <span class="comment">% Step 1: setLevel(1) swaps obj.data.images/cameras from the Half</span>
+        <span class="comment">%         pair to the Full pair (block layout differs per level,</span>
+        <span class="comment">%         so images and cameras must switch together).</span>
+        <span class="comment">% Step 2: updateResolution() reads the new block canvas size from</span>
+        <span class="comment">%         the datastore and reallocates GPU buffers (image, X, Y, T).</span>
+        <span class="comment">%         Without this call, GPU buffers stay at half-res size.</span>
+        <span class="comment">% Step 3: Rebuild ds and mbq so they reference the new datastores,</span>
+        <span class="comment">%         and recompute totalNumBlocks/gradDecay (block count per</span>
+        <span class="comment">%         image differs between resolution levels).</span>
+        <span class="comment">% -----------------------------------------------------------------</span>
+        <span class="keyword">if</span> epoch == levelSwitchEpoch
+            obj.data.setLevel(1);
+            obj.updateResolution();
+            ds  = combine(obj.data.images, obj.data.cameras);
+            mbq = minibatchqueue(ds, <span class="keyword">...</span>
+                <span class="string">'MiniBatchSize'</span>,    miniBatchSize, <span class="keyword">...</span>
+                <span class="string">'PartialMiniBatch'</span>, <span class="string">'discard'</span>, <span class="keyword">...</span>
+                <span class="string">'OutputEnvironment'</span>,GaussianSplatter.outEnv(obj.useGPU), <span class="keyword">...</span>
+                <span class="string">'MiniBatchFormat'</span>,  [<span class="string">"SSCB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"CB"</span>,<span class="string">"SSCB"</span>,<span class="string">"SCB"</span>,<span class="string">"SCB"</span>]);
+            totalNumBlocks        = obj.data.images.TotalNumBlocks;
+            gradDecay             = 1 - miniBatchSize / totalNumBlocks;
+            numIterationsPerEpoch = ceil(totalNumBlocks / miniBatchSize);
+            fprintf(<span class="string">'Switched to full-resolution training at epoch %d.\n'</span>, epoch);
+
+            <span class="comment">% Print GPU Memory</span>
+            obj.printGPUMemory(sprintf(<span class="string">'[Resolution Switch] Epoch %d'</span>, epoch));
+        <span class="keyword">end</span>
+
+        <span class="comment">% Shuffle data at the start of each epoch</span>
         shuffle(mbq);
 
         <span class="keyword">while</span> hasdata(mbq) &amp;&amp; ~monitor.Stop
             iteration = iteration + 1;
 
-            <span class="comment">% Fetch Data</span>
-            [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,<span class="keyword">...</span>
-                obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,<span class="keyword">...</span><span class="comment">.</span>
-                obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+            <span class="comment">% Fetch next mini-batch. Data arrives on GPU (OutputEnvironment='gpu').</span>
+            <span class="comment">% Camera scalars arrive as 'CB' (1&times;B); squeeze removes leading dim.</span>
+            <span class="comment">% blockRow/blockCol are only needed for post-training stitching,</span>
+            <span class="comment">% so they're ignored (~) in the hot training loop.</span>
+            [obj.image_gt, camId, camBlockId, ~, ~, camW, camH, camFx, camFy, camCx, camCy, <span class="keyword">...</span>
+             obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(mbq);
 
-            <span class="keyword">if</span> (iteration == 1)
-                <span class="comment">% Initialize storage and move to GPU if input is on GPU</span>
+            obj.camera.id      = squeeze(camId);
+            obj.camera.blockId = squeeze(camBlockId);
+            obj.camera.width   = squeeze(camW);
+            obj.camera.height  = squeeze(camH);
+            obj.camera.fx      = squeeze(camFx);
+            obj.camera.fy      = squeeze(camFy);
+            obj.camera.cx      = squeeze(camCx);
+            obj.camera.cy      = squeeze(camCy);
+
+            <span class="keyword">if</span> iteration == 1
+                <span class="comment">% Initialize GPU storage once on the first iteration</span>
                 obj.initStorage(miniBatchSize);
+
+                <span class="comment">% Print GPU Memory</span>
+                obj.printGPUMemory(<span class="string">'[Iteration 1] After GPU allocation'</span>);
             <span class="keyword">end</span>
 
-            <span class="comment">% Optimization Step</span>
-            [loss,grads] = dlfeval(@obj.modelStep,obj.params);
+            <span class="comment">% Forward pass, loss computation, and gradient calculation</span>
+            [loss, grads] = dlfeval(@obj.modelStep, obj.params);
 
-            <span class="comment">% Update Weights</span>
-            [obj.params,avgGrad,avgSqGrad] = adamupdate(obj.params,grads,avgGrad,avgSqGrad,iteration,learnRate,gradDecay,sqGradDecay);
+            <span class="comment">% Update learnable parameters with Adam optimizer</span>
+            [obj.params, avgGrad, avgSqGrad] = adamupdate( <span class="keyword">...</span>
+                obj.params, grads, avgGrad, avgSqGrad, <span class="keyword">...</span>
+                iteration, learnRate, gradDecay, sqGradDecay);
 
-            <span class="comment">% Extract Loss Value</span>
+            <span class="comment">% Extract scalar loss for logging</span>
             loss = extractdata(loss);
 
-            <span class="comment">% Update the training progress monitor</span>
-            recordMetrics(monitor,iteration,Loss=loss);
-            updateInfo(monitor,Epoch=epoch + <span class="string">" of "</span> + numEpochs);
-            monitor.Progress = 100 * iteration/numIterations;
+            <span class="comment">% Update training progress monitor</span>
+            recordMetrics(monitor, iteration, Loss=loss);
+            updateInfo(monitor, Epoch=epoch + <span class="string">" of "</span> + numEpochs);
+            monitor.Progress = min(max(100 * iteration / numIterations,0),100);
 
-            <span class="comment">% Visualization</span>
-            idx = find(extractdata(obj.camera.id) == imageIdxToShow);
+            <span class="comment">% Visualize the current render for a fixed reference block</span>
+            idx = find(extractdata(obj.camera.blockId) == blockIdxToShow);
             <span class="keyword">if</span> ~isempty(idx)
                 figure(1);
                 imshow(extractdata(obj.image(:,:,:,idx)));
                 title(sprintf(<span class="string">'Epoch %d | Loss: %.4f'</span>, epoch, loss));
                 drawnow;
+
+                <span class="comment">% Print GPU Memory</span>
+                obj.printGPUMemory(sprintf(<span class="string">'[Periodic Monitoring] Epoch %d'</span>, epoch));
             <span class="keyword">end</span>
         <span class="keyword">end</span>
 
-        <span class="comment">% Adaptive densification</span>
-        <span class="keyword">if</span> enableAdaptiveDensification &amp;&amp; mod(epoch, densifyInterval) == 0 &amp;&amp; epoch &gt; 1 &amp;&amp; epoch &lt; numEpochs
-            obj.pruneAndDensify(avgGrad,prunningRatio);
+        <span class="comment">% -----------------------------------------------------------------</span>
+        <span class="comment">% Adaptive densification: prune dead Gaussians and clone/split</span>
+        <span class="comment">% high-gradient ones to increase scene detail over time.</span>
+        <span class="comment">% -----------------------------------------------------------------</span>
+        <span class="keyword">if</span> enableAdaptiveDensification &amp;&amp; <span class="keyword">...</span>
+                mod(epoch, densifyInterval) == 0 &amp;&amp; <span class="keyword">...</span>
+                epoch &gt; 1 &amp;&amp; epoch &lt; numEpochs
+            obj.printGPUMemory(sprintf(<span class="string">'[Before Densify] Epoch %d'</span>, epoch));
+            obj.pruneAndDensify(avgGrad, avgSqGrad, prunningRatio);
+            obj.printGPUMemory(sprintf(<span class="string">'[After Densify] Epoch %d'</span>, epoch));
         <span class="keyword">end</span>
 
-        <span class="comment">% Decrease learning rate</span>
+        <span class="comment">% Decay learning rate at regular intervals</span>
         <span class="keyword">if</span> mod(epoch, learnInterval) == 0 &amp;&amp; epoch &gt; 1 &amp;&amp; epoch &lt; numEpochs
-            learnRate = 0.5*learnRate;
+            learnRate = 0.5 * learnRate;
         <span class="keyword">end</span>
     <span class="keyword">end</span>
 
-    <span class="comment">% Save params</span>
+    <span class="comment">% Save trained Gaussian parameters to disk</span>
     obj.saveGaussians(<span class="string">"gaussians.mat"</span>);
 <span class="keyword">end</span>
 </pre>
-<pre class="codeoutput">Move arrays to GPU environment...
-Densification: 29 clones, 71 splits. 
-Densification: 46 clones, 54 splits. 
-Densification: 48 clones, 52 splits. 
-Densification: 47 clones, 52 splits. 
-Densification: 47 clones, 52 splits. 
-Densification: 55 clones, 44 splits. 
-Densification: 60 clones, 35 splits. 
-Densification: 61 clones, 35 splits. 
-Densification: 52 clones, 42 splits. 
-Densification: 48 clones, 47 splits. 
-Densification: 50 clones, 35 splits. 
-Densification: 52 clones, 32 splits. 
+<pre class="codeoutput">Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+[[Iteration 1] After GPU allocation] GPU memory used: 1118.31 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 1] GPU memory used: 1388.47 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 2] GPU memory used: 1448.49 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 3] GPU memory used: 1488.54 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 4] GPU memory used: 1542.56 MB / 6438.78 MB
+[[Before Densify] Epoch 4] GPU memory used: 1567.48 MB / 6438.78 MB
+Densification: 62 clones, 38 splits.
+[[After Densify] Epoch 4] GPU memory used: 1567.48 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 5] GPU memory used: 1615.42 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 6] GPU memory used: 1674.49 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 7] GPU memory used: 1665.48 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 8] GPU memory used: 1618.54 MB / 6438.78 MB
+[[Before Densify] Epoch 8] GPU memory used: 1563.47 MB / 6438.78 MB
+Densification: 63 clones, 37 splits.
+[[After Densify] Epoch 8] GPU memory used: 1563.47 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 9] GPU memory used: 1536.83 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 10] GPU memory used: 1621.94 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 11] GPU memory used: 1619.98 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 12] GPU memory used: 1514.37 MB / 6438.78 MB
+[[Before Densify] Epoch 12] GPU memory used: 1588.61 MB / 6438.78 MB
+Densification: 68 clones, 32 splits.
+[[After Densify] Epoch 12] GPU memory used: 1588.61 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 13] GPU memory used: 1728.91 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 14] GPU memory used: 1695.32 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 15] GPU memory used: 1711.56 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 16] GPU memory used: 1660.26 MB / 6438.78 MB
+[[Before Densify] Epoch 16] GPU memory used: 1645.82 MB / 6438.78 MB
+Densification: 72 clones, 28 splits.
+[[After Densify] Epoch 16] GPU memory used: 1645.82 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 17] GPU memory used: 1739.67 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 18] GPU memory used: 1858.93 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 19] GPU memory used: 1841.05 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 20] GPU memory used: 1672.39 MB / 6438.78 MB
+[[Before Densify] Epoch 20] GPU memory used: 1683.12 MB / 6438.78 MB
+Densification: 71 clones, 29 splits.
+[[After Densify] Epoch 20] GPU memory used: 1683.12 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 21] GPU memory used: 1852.61 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 22] GPU memory used: 1808.95 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 23] GPU memory used: 1854.78 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 24] GPU memory used: 1738.50 MB / 6438.78 MB
+[[Before Densify] Epoch 24] GPU memory used: 1770.09 MB / 6438.78 MB
+Densification: 73 clones, 27 splits.
+[[After Densify] Epoch 24] GPU memory used: 1770.09 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 25] GPU memory used: 1633.14 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 26] GPU memory used: 1827.61 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 27] GPU memory used: 1724.69 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 28] GPU memory used: 1725.25 MB / 6438.78 MB
+[[Before Densify] Epoch 28] GPU memory used: 1669.08 MB / 6438.78 MB
+Densification: 73 clones, 27 splits.
+[[After Densify] Epoch 28] GPU memory used: 1669.08 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 29] GPU memory used: 1651.38 MB / 6438.78 MB
+Switched to full-resolution datastore.
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+GPU buffers reallocated to 153 x 139 canvas (separable coords).
+Switched to full-resolution training at epoch 30.
+[[Resolution Switch] Epoch 30] GPU memory used: 1677.01 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 30] GPU memory used: 1697.57 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 31] GPU memory used: 1861.59 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 32] GPU memory used: 1776.88 MB / 6438.78 MB
+[[Before Densify] Epoch 32] GPU memory used: 1722.90 MB / 6438.78 MB
+Densification: 50 clones, 50 splits.
+[[After Densify] Epoch 32] GPU memory used: 1722.90 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 33] GPU memory used: 1756.57 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 34] GPU memory used: 1774.47 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 35] GPU memory used: 1699.59 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 36] GPU memory used: 1664.63 MB / 6438.78 MB
+[[Before Densify] Epoch 36] GPU memory used: 1815.24 MB / 6438.78 MB
+Densification: 53 clones, 47 splits.
+[[After Densify] Epoch 36] GPU memory used: 1815.24 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 37] GPU memory used: 1737.31 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 38] GPU memory used: 1729.45 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 39] GPU memory used: 1844.52 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 40] GPU memory used: 1718.43 MB / 6438.78 MB
+[[Before Densify] Epoch 40] GPU memory used: 1822.74 MB / 6438.78 MB
+Densification: 57 clones, 43 splits.
+[[After Densify] Epoch 40] GPU memory used: 1822.74 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 41] GPU memory used: 1708.11 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 42] GPU memory used: 1699.60 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 43] GPU memory used: 1742.25 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 44] GPU memory used: 1858.91 MB / 6438.78 MB
+[[Before Densify] Epoch 44] GPU memory used: 1813.20 MB / 6438.78 MB
+Densification: 55 clones, 45 splits.
+[[After Densify] Epoch 44] GPU memory used: 1813.20 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 45] GPU memory used: 1714.77 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 46] GPU memory used: 1766.63 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 47] GPU memory used: 1807.07 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 48] GPU memory used: 1679.73 MB / 6438.78 MB
+[[Before Densify] Epoch 48] GPU memory used: 1797.32 MB / 6438.78 MB
+Densification: 50 clones, 50 splits.
+[[After Densify] Epoch 48] GPU memory used: 1797.32 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 49] GPU memory used: 1764.49 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 50] GPU memory used: 1775.04 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 51] GPU memory used: 1644.77 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 52] GPU memory used: 1716.47 MB / 6438.78 MB
+[[Before Densify] Epoch 52] GPU memory used: 1751.02 MB / 6438.78 MB
+Densification: 54 clones, 46 splits.
+[[After Densify] Epoch 52] GPU memory used: 1751.02 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 53] GPU memory used: 1659.95 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 54] GPU memory used: 1757.18 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 55] GPU memory used: 1825.51 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 56] GPU memory used: 1783.43 MB / 6438.78 MB
+[[Before Densify] Epoch 56] GPU memory used: 1863.86 MB / 6438.78 MB
+Densification: 53 clones, 47 splits.
+[[After Densify] Epoch 56] GPU memory used: 1863.86 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 57] GPU memory used: 1861.72 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 58] GPU memory used: 1790.26 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 59] GPU memory used: 1722.81 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 60] GPU memory used: 1742.00 MB / 6438.78 MB
+[[Before Densify] Epoch 60] GPU memory used: 1765.30 MB / 6438.78 MB
+Densification: 55 clones, 45 splits.
+[[After Densify] Epoch 60] GPU memory used: 1765.30 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 61] GPU memory used: 1701.95 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 62] GPU memory used: 1736.01 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 63] GPU memory used: 1622.31 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 64] GPU memory used: 1768.35 MB / 6438.78 MB
+[[Before Densify] Epoch 64] GPU memory used: 1715.24 MB / 6438.78 MB
+Densification: 61 clones, 39 splits.
+[[After Densify] Epoch 64] GPU memory used: 1715.24 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 65] GPU memory used: 1727.07 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 66] GPU memory used: 1771.94 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 67] GPU memory used: 1776.55 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 68] GPU memory used: 1773.32 MB / 6438.78 MB
+[[Before Densify] Epoch 68] GPU memory used: 1749.10 MB / 6438.78 MB
+Densification: 54 clones, 45 splits.
+[[After Densify] Epoch 68] GPU memory used: 1749.10 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 69] GPU memory used: 1774.72 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 70] GPU memory used: 1810.69 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 71] GPU memory used: 1887.29 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 72] GPU memory used: 1783.78 MB / 6438.78 MB
+[[Before Densify] Epoch 72] GPU memory used: 1821.15 MB / 6438.78 MB
+Densification: 45 clones, 55 splits.
+[[After Densify] Epoch 72] GPU memory used: 1821.15 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 73] GPU memory used: 1725.08 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 74] GPU memory used: 1765.30 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 75] GPU memory used: 1735.19 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 76] GPU memory used: 1867.40 MB / 6438.78 MB
+[[Before Densify] Epoch 76] GPU memory used: 1835.82 MB / 6438.78 MB
+Densification: 54 clones, 42 splits.
+[[After Densify] Epoch 76] GPU memory used: 1835.82 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 77] GPU memory used: 1771.54 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 78] GPU memory used: 1676.01 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 79] GPU memory used: 1718.45 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 80] GPU memory used: 1735.56 MB / 6438.78 MB
+[[Before Densify] Epoch 80] GPU memory used: 1764.81 MB / 6438.78 MB
+Densification: 62 clones, 37 splits.
+[[After Densify] Epoch 80] GPU memory used: 1764.81 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 81] GPU memory used: 1721.04 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 82] GPU memory used: 1721.21 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 83] GPU memory used: 1712.92 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 84] GPU memory used: 1734.05 MB / 6438.78 MB
+[[Before Densify] Epoch 84] GPU memory used: 1758.44 MB / 6438.78 MB
+Densification: 72 clones, 24 splits.
+[[After Densify] Epoch 84] GPU memory used: 1758.44 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 85] GPU memory used: 1685.10 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 86] GPU memory used: 1820.26 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 87] GPU memory used: 1737.96 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 88] GPU memory used: 1735.71 MB / 6438.78 MB
+[[Before Densify] Epoch 88] GPU memory used: 1880.46 MB / 6438.78 MB
+Densification: 65 clones, 32 splits.
+[[After Densify] Epoch 88] GPU memory used: 1880.46 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 89] GPU memory used: 1810.70 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 90] GPU memory used: 1748.87 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 91] GPU memory used: 1766.03 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 92] GPU memory used: 1766.94 MB / 6438.78 MB
+[[Before Densify] Epoch 92] GPU memory used: 1767.65 MB / 6438.78 MB
+Densification: 61 clones, 35 splits.
+[[After Densify] Epoch 92] GPU memory used: 1767.65 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 93] GPU memory used: 1814.94 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 94] GPU memory used: 1701.81 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 95] GPU memory used: 1689.74 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 96] GPU memory used: 1791.94 MB / 6438.78 MB
+[[Before Densify] Epoch 96] GPU memory used: 1655.10 MB / 6438.78 MB
+Densification: 61 clones, 35 splits.
+[[After Densify] Epoch 96] GPU memory used: 1655.10 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 97] GPU memory used: 1783.79 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 98] GPU memory used: 1721.21 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 99] GPU memory used: 1764.64 MB / 6438.78 MB
+[[Periodic Monitoring] Epoch 100] GPU memory used: 1753.91 MB / 6438.78 MB
 </pre>
-<img vspace="5" hspace="5" src="trainGaussianSplat_02.png" alt=""> <img vspace="5" hspace="5" src="trainGaussianSplat_03.png" alt=""> <h2 id="14">Preview Results</h2>
+<img vspace="5" hspace="5" src="trainGaussianSplat_02.png" alt=""> <img vspace="5" hspace="5" src="trainGaussianSplat_03.png" alt=""> <h2 id="13">Preview Results</h2>
+<p>Render numGenImages full images, each stitched back together from its blocks, comparing prediction vs ground truth &mdash; rather than showing individual (scrambled, out-of-order) blocks.</p>
 <pre class="codeinput">figure(2);
 numGenImages = 8;
 load(<span class="string">"gaussians.mat"</span>);
-shuffle(mbq)
-<span class="keyword">for</span> iteration = 1:ceil(numGenImages/miniBatchSize)
-    [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,<span class="keyword">...</span>
-        obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,<span class="keyword">...</span><span class="comment">.</span>
-        obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
-    <span class="keyword">if</span> (iteration == 1) &amp;&amp; isempty(obj.image)
-        obj.initStorage(miniBatchSize);
-    <span class="keyword">end</span>
-    obj.createImage(params);
-
-    genImages = cat(4,gather(extractdata(obj.image)),gather(extractdata(obj.image_gt)));
-    subplot(2,2,iteration);
-    imshow(imtile(genImages))
-<span class="keyword">end</span>
-sgtitle(<span class="string">"Generated Images"</span>)
+obj.previewResults(params, numGenImages);
+</pre>
+<pre class="codeoutput">Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
+Allocating persistent projection buffers (2000 Gaussians)...
+Moving learnable parameters to GPU...
 </pre>
 <img vspace="5" hspace="5" src="trainGaussianSplat_04.png" alt=""> <p class="footer">
 <br>
@@ -269,165 +548,270 @@ sgtitle(<span class="string">"Generated Images"</span>)
 <!--
 ##### SOURCE BEGIN #####
 %% Train 3D Gaussian Splatting (3DGS)
-% This example shows how-to train and generate 2D images using a 
+% This example shows how-to train and generate 2D images using a
 % minimal implementation of 3D Gaussian splatting.
+%
+% GPU Target: NVIDIA RTX 4050 Laptop GPU
+%   - 6 GB GDDR6 VRAM
+%   - 192 GB/s memory bandwidth
+%   - 2560 CUDA cores (Ada Lovelace)
+%
+% Image Loading Design:
+%   Images are loaded as a blockedImageDatastore (ColmapData.images); each
+%   read() returns one fixed-size block (blockSize + 2*overlap), not a full
+%   image. Camera info is repeated once per block with cx/cy shifted to the
+%   block's local origin, so combine(obj.data.images, obj.data.cameras)
+%   still gives strict 1-to-1 correspondence. blockSize defaults to
+%   GaussianSplatter.autoSelectBlockSize(), which picks the size (per
+%   dimension, in [64, 160]) that minimizes total partial-block zero-padding
+%   summed over both resolution levels.
+%
+% GPU-Vectorized Rendering:
+%   Rasterization no longer loops per-Gaussian or per-batch-element:
+%     - projectGaussiansWithCulling processes all Gaussians x all blocks in
+%       the batch as [N x B] arrays in one pass (camera transform,
+%       projection, Sigma_2D via an elementwise J*Sigma*J^T, depth sort),
+%       scattering results into persistent buffers by pure indexing.
+%     - rasterizeToGPU composites depth-sorted Gaussians in vectorized
+%       chunks per tile (fused [H' x W' x K] alpha maps, cumprod
+%       transmittance, one image write per tile), with a per-chunk
+%       (not per-Gaussian) early-termination check once a tile saturates.
+%   Because the L1/SSIM loss is computed directly on this.image/this.image_gt
+%   (now block-sized), the loss is automatically scoped to the block instead
+%   of the full image — increasing miniBatchSize below now simply increases
+%   the number of blocks processed per training step.
+%
+% Multi-Resolution Schedule:
+%   Training starts at half resolution (fast early convergence).
+%   At levelSwitchEpoch: setLevel(1) swaps both the image and camera
+%   datastores (block layout differs per resolution), then
+%   updateResolution() reallocates GPU buffers to the new block canvas size.
+%   Without updateResolution(), GPU buffers stay at half-res dimensions.
 
 %% Load Data
-% Specify the folder containing the SFM generated sparse 3d pointcloud as
-% input, generated in COLMAP format. Download example dataset from
-% <https://https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip>.
+% Specify the folder containing the SFM generated sparse 3D point cloud as
+% input, generated in COLMAP format. Download example dataset from:
+% https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
 datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 2000; % more gaussians creates sharper images, but needs more memory and has longer training time
+numGaussians = 2000; % More Gaussians creates sharper images, but needs more
+                     % memory and has longer training time.
 numImages    = 20;
 
+%% Blocked Image / Tile Settings
+% Block/tile size used both by ColmapData's blockedImageDatastore (dataset
+% block grid) and by GaussianSplatter.createImage's internal tile-culling
+% loop. overlapSize adds a context halo (BorderSize) around each block;
+% it does NOT change the block grid, so it has no effect on padding —
+% only blockSize does.
+%
+% Leaving blockSize empty lets GaussianSplatter.autoSelectBlockSize() pick
+% the size (per dimension, in [64, 160]) that minimizes total partial-block
+% zero-padding summed over both resolution levels.
+blockSize   = [];
+overlapSize = [8, 8];
+
 %% Define Learnable Parameters
-% Construct object and to load data and create learnable parameters
-obj = GaussianSplatter(datasetPath, numGaussians, numImages);
+% Construct object to load data and create learnable parameters.
+obj = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize, overlapSize);
 
 %% Specify Training Options
-% Train for 50 epochs with a mini-batch size of 1.
-miniBatchSize = 2;
-numEpochs     = ceil(numGaussians/20);
+% miniBatchSize now counts BLOCKS (not full images) per training step —
+% raise it to increase the number of blocked images processed per batch.
+totalNumBlocks = obj.data.images.TotalNumBlocks;
+miniBatchSize = 2*totalNumBlocks/numImages;
+numEpochs     = ceil(numGaussians / 20);
 
-%%
-% Specify the options for Adam optimization:
+% Adam optimization options
 learnRate     = 0.02;
-learnInterval = ceil(numEpochs/5);
-gradDecay     = 1 - miniBatchSize/numImages;
+learnInterval = ceil(numEpochs / 5);
+gradDecay     = 1 - miniBatchSize / totalNumBlocks;
 sqGradDecay   = 0.999;
 
+%% Multi-Resolution Schedule
+% Switch from half-resolution to full resolution at 30% of total epochs.
+% After setLevel(1), updateResolution() must be called to reallocate GPU
+% buffers (image, X, Y, T) to the new canvas dimensions. Without this,
+% buffers remain at half-resolution, clipping Gaussian projections.
+levelSwitchEpoch = max(1, floor(numEpochs * 0.3));
 
 %% Train Model
-% Train the 3D Gaussian splat model using a custom training loop. 
-
-%%
-% Training the model is a computationally expensive process that can take
-% hours. To save time while running this example, load a pretrained network
-% by setting doTraining to false. To train the network yourself, set
-% doTraining to true.
+% To save time, load a pretrained network by setting doTraining to false.
+% To train the network yourself, set doTraining to true.
 doTraining = true;
 
-%%
-% Create a minibatchqueue object that processes and manages mini-batches of
-% images and camera data during training. 
-ds = combine(obj.data.images, obj.data.cameras); % Combined datastore
-mbq = minibatchqueue(ds,'MiniBatchSize',miniBatchSize, ...
-    'PartialMiniBatch','discard','OutputEnvironment','auto',...
-    'MiniBatchFor',["SSCB","B","B","B","B","B","B","B","SSB","SB","SB"]);
+%% Create minibatchqueue
+% combine() merges the blocked-image datastore with the per-block camera
+% arrayDatastores. 1-to-1 correspondence is guaranteed because ColmapData
+% repeats/offsets one camera entry per block, matching blockedImageDatastore's
+% read order.
+%
+% OutputEnvironment='gpu' transfers each block directly to GPU VRAM on
+% the RTX 4050, bypassing a redundant CPU staging copy.
+%
+% MiniBatchFormat:
+%   Image:            'SSCB' (H × W × Channel × Batch)
+%   Camera scalars:   'CB'   (1 × Batch — arrayDatastore adds leading dim)
+%   Rcw rotation:     'SSCB' (3 × 3 × 1 × Batch)
+%   tcw, twc vectors: 'SCB'  (3 × 1 × Batch)
+ds = combine(obj.data.images, obj.data.cameras);
+mbq = minibatchqueue(ds, ...
+    'MiniBatchSize',    miniBatchSize, ...
+    'PartialMiniBatch', 'discard', ...
+    'OutputEnvironment',GaussianSplatter.outEnv(obj.useGPU), ...
+    'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
 
-%%
-% Adaptive densification
+%% Adaptive Densification Settings
 enableAdaptiveDensification = true;
-densifyInterval = ceil(numEpochs/25);
-prunningRatio = 0.05;
+densifyInterval = ceil(numEpochs / 25);
+prunningRatio   = 0.05;
 
-%%
-% Initialize the parameters for Adam optimization.
-avgGrad = [];
+%% Initialize Adam Optimizer State
+avgGrad   = [];
 avgSqGrad = [];
 
-%%
-% Calculate the total number of iterations for the training progress monitor
-numIterationsPerEpoch = ceil(numImages/miniBatchSize);
-numIterations = numEpochs * numIterationsPerEpoch;
+%% Training Progress Bookkeeping
+numIterationsPerEpoch = ceil(totalNumBlocks / miniBatchSize);
+numIterations         = numEpochs * numIterationsPerEpoch;
 
-%%
-% Initialize the training progress monitor
 if doTraining
-    monitor = trainingProgressMonitor('Metrics',"Loss",'Info',"Epoch",'XLabel',"Iteration");
+    monitor = trainingProgressMonitor( ...
+        'Metrics', "Loss", ...
+        'Info',    "Epoch", ...
+        'XLabel',  "Iteration");
 end
 
-%%
-% Initialize the preview render
-imageIdxToShow = preview(obj.data.cameras);
-imageIdxToShow = imageIdxToShow{1};
+%% Initialize Preview Render Index
+% Lock onto a single, unique blockId (not the reused source-image id) so
+% the live preview always shows the same physical block across epochs.
+blockIdxToShow = 1;
 
-%%
-% Train the model using a custom training loop. For each epoch, shuffle the
-% images and camera data and loop over mini-batches. At the end of each
-% iteration, display the training progress.
+%% Custom Training Loop
 if doTraining
     iteration = 0;
-    epoch = 0;
+    epoch     = 0;
+
     while epoch < numEpochs && ~monitor.Stop
         epoch = epoch + 1;
 
-        % Shuffle data
+        % REPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASH-
+        % Multi-resolution schedule.
+        % Step 1: setLevel(1) swaps obj.data.images/cameras from the Half
+        %         pair to the Full pair (block layout differs per level,
+        %         so images and cameras must switch together).
+        % Step 2: updateResolution() reads the new block canvas size from
+        %         the datastore and reallocates GPU buffers (image, X, Y, T).
+        %         Without this call, GPU buffers stay at half-res size.
+        % Step 3: Rebuild ds and mbq so they reference the new datastores,
+        %         and recompute totalNumBlocks/gradDecay (block count per
+        %         image differs between resolution levels).
+        % REPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASH-
+        if epoch == levelSwitchEpoch
+            obj.data.setLevel(1);
+            obj.updateResolution();
+            ds  = combine(obj.data.images, obj.data.cameras);
+            mbq = minibatchqueue(ds, ...
+                'MiniBatchSize',    miniBatchSize, ...
+                'PartialMiniBatch', 'discard', ...
+                'OutputEnvironment',GaussianSplatter.outEnv(obj.useGPU), ...
+                'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
+            totalNumBlocks        = obj.data.images.TotalNumBlocks;
+            gradDecay             = 1 - miniBatchSize / totalNumBlocks;
+            numIterationsPerEpoch = ceil(totalNumBlocks / miniBatchSize);
+            fprintf('Switched to full-resolution training at epoch %d.\n', epoch);
+
+            % Print GPU Memory
+            obj.printGPUMemory(sprintf('[Resolution Switch] Epoch %d', epoch));
+        end
+
+        % Shuffle data at the start of each epoch
         shuffle(mbq);
 
         while hasdata(mbq) && ~monitor.Stop
             iteration = iteration + 1;
 
-            % Fetch Data
-            [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,...
-                obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,....
-                obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
+            % Fetch next mini-batch. Data arrives on GPU (OutputEnvironment='gpu').
+            % Camera scalars arrive as 'CB' (1×B); squeeze removes leading dim.
+            % blockRow/blockCol are only needed for post-training stitching,
+            % so they're ignored (~) in the hot training loop.
+            [obj.image_gt, camId, camBlockId, ~, ~, camW, camH, camFx, camFy, camCx, camCy, ...
+             obj.camera.Rcw, obj.camera.tcw, obj.camera.twc] = next(mbq);
 
-            if (iteration == 1)
-                % Initialize storage and move to GPU if input is on GPU
+            obj.camera.id      = squeeze(camId);
+            obj.camera.blockId = squeeze(camBlockId);
+            obj.camera.width   = squeeze(camW);
+            obj.camera.height  = squeeze(camH);
+            obj.camera.fx      = squeeze(camFx);
+            obj.camera.fy      = squeeze(camFy);
+            obj.camera.cx      = squeeze(camCx);
+            obj.camera.cy      = squeeze(camCy);
+
+            if iteration == 1
+                % Initialize GPU storage once on the first iteration
                 obj.initStorage(miniBatchSize);
+
+                % Print GPU Memory
+                obj.printGPUMemory('[Iteration 1] After GPU allocation');
             end
 
-            % Optimization Step
-            [loss,grads] = dlfeval(@obj.modelStep,obj.params);
+            % Forward pass, loss computation, and gradient calculation
+            [loss, grads] = dlfeval(@obj.modelStep, obj.params);
 
-            % Update Weights
-            [obj.params,avgGrad,avgSqGrad] = adamupdate(obj.params,grads,avgGrad,avgSqGrad,iteration,learnRate,gradDecay,sqGradDecay);
+            % Update learnable parameters with Adam optimizer
+            [obj.params, avgGrad, avgSqGrad] = adamupdate( ...
+                obj.params, grads, avgGrad, avgSqGrad, ...
+                iteration, learnRate, gradDecay, sqGradDecay);
 
-            % Extract Loss Value
+            % Extract scalar loss for logging
             loss = extractdata(loss);
 
-            % Update the training progress monitor
-            recordMetrics(monitor,iteration,Loss=loss);
-            updateInfo(monitor,Epoch=epoch + " of " + numEpochs);
-            monitor.Progress = 100 * iteration/numIterations;
+            % Update training progress monitor
+            recordMetrics(monitor, iteration, Loss=loss);
+            updateInfo(monitor, Epoch=epoch + " of " + numEpochs);
+            monitor.Progress = min(max(100 * iteration / numIterations,0),100);
 
-            % Visualization
-            idx = find(extractdata(obj.camera.id) == imageIdxToShow);
+            % Visualize the current render for a fixed reference block
+            idx = find(extractdata(obj.camera.blockId) == blockIdxToShow);
             if ~isempty(idx)
                 figure(1);
                 imshow(extractdata(obj.image(:,:,:,idx)));
                 title(sprintf('Epoch %d | Loss: %.4f', epoch, loss));
                 drawnow;
+
+                % Print GPU Memory
+                obj.printGPUMemory(sprintf('[Periodic Monitoring] Epoch %d', epoch));
             end
         end
 
-        % Adaptive densification
-        if enableAdaptiveDensification && mod(epoch, densifyInterval) == 0 && epoch > 1 && epoch < numEpochs
-            obj.pruneAndDensify(avgGrad,prunningRatio);
+        % REPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASH-
+        % Adaptive densification: prune dead Gaussians and clone/split
+        % high-gradient ones to increase scene detail over time.
+        % REPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASHREPLACE_WITH_DASH_DASH-
+        if enableAdaptiveDensification && ...
+                mod(epoch, densifyInterval) == 0 && ...
+                epoch > 1 && epoch < numEpochs
+            obj.printGPUMemory(sprintf('[Before Densify] Epoch %d', epoch));
+            obj.pruneAndDensify(avgGrad, avgSqGrad, prunningRatio);
+            obj.printGPUMemory(sprintf('[After Densify] Epoch %d', epoch));
         end
 
-        % Decrease learning rate
+        % Decay learning rate at regular intervals
         if mod(epoch, learnInterval) == 0 && epoch > 1 && epoch < numEpochs
-            learnRate = 0.5*learnRate;
+            learnRate = 0.5 * learnRate;
         end
     end
 
-    % Save params
+    % Save trained Gaussian parameters to disk
     obj.saveGaussians("gaussians.mat");
 end
 
 %% Preview Results
+% Render numGenImages full images, each stitched back together from its
+% blocks, comparing prediction vs ground truth — rather than showing
+% individual (scrambled, out-of-order) blocks.
 figure(2);
 numGenImages = 8;
 load("gaussians.mat");
-shuffle(mbq)
-for iteration = 1:ceil(numGenImages/miniBatchSize)
-    [obj.image_gt,obj.camera.id,obj.camera.width,obj.camera.height,...
-        obj.camera.fx,obj.camera.fy,obj.camera.cx,obj.camera.cy,....
-        obj.camera.Rcw,obj.camera.tcw,obj.camera.twc] = next(mbq);
-    if (iteration == 1) && isempty(obj.image)
-        obj.initStorage(miniBatchSize);
-    end
-    obj.createImage(params);
-
-    genImages = cat(4,gather(extractdata(obj.image)),gather(extractdata(obj.image_gt)));
-    subplot(2,2,iteration);
-    imshow(imtile(genImages))
-end
-sgtitle("Generated Images")
-
-
+obj.previewResults(params, numGenImages);
 ##### SOURCE END #####
 -->
 </body>
