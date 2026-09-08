@@ -24,16 +24,16 @@ classdef GaussianSplatter < handle
     %   The new formulation is cheaper (2x2 inversion vs 3D SVD), correct
     %   (uses both fx and fy), and matches the reference implementation.
     %
-    % Tile-Aware Rasterization:
+    % Block-Aware Rasterization:
     %   this.data.images (ColmapData) now yields one blockedImageDatastore
     %   block per read(), sized blockSize + 2*overlap, with camera cx/cy
-    %   already shifted to that block's local origin. blockSize therefore
-    %   drives BOTH the dataset's block grid and createImage's internal
-    %   tile-culling loop below — each Gaussian is culled to only the tiles
-    %   its bounding box overlaps within the current block canvas.
+    %   already shifted to that block's local origin. Overlap between
+    %   blocks is baked into ColmapData's overlapping BlockOffsets, so each
+    %   block canvas is rasterized as a single unit — no further spatial
+    %   tile subdivision happens here.
     %
-    %   Tile culling is performed ONCE on CPU per batch (via
-    %   buildTileList), then rasterizeToGPU processes pre-built tile lists
+    %   Gaussian culling is performed ONCE on CPU per batch (via
+    %   buildTileList), then rasterizeToGPU processes the pre-built lists
     %   without any extractdata() calls in the inner loop.
     %
     %   Because the loss (L1 + SSIM) is computed on this.image/this.image_gt
@@ -77,11 +77,10 @@ classdef GaussianSplatter < handle
         imageHeight
         imageChannel
 
-        % --- Tile Settings ---
-        % Block/tile dimensions shared by the dataset's blockedImage grid
-        % (ColmapData) and the rasterizer canvas partitioning — each read()
-        % delivers one block of blockSize + 2*overlap, so the canvas is
-        % usually a single tile.
+        % --- Block Settings ---
+        % Block dimensions shared by the dataset's blockedImage grid
+        % (ColmapData) and the rasterizer canvas — each read() delivers
+        % one block of blockSize + 2*overlap, rasterized as a single unit.
         %
         % Default: auto-selected based on GPU compute capability.
         blockSize = [];  % Will be auto-selected in constructor if not provided
@@ -152,13 +151,12 @@ classdef GaussianSplatter < handle
         radii_v_buffer     % [numGaussians x 1 x B] plain gpuArray
         colors_buffer      % [numGaussians x 1 x 3 x B] dlarray 'SSCB'
 
-        % --- CPU-based Tile Lists (cached per batch) ---
-        % Pre-computed tile membership for each Gaussian, built once per batch
-        % on CPU. Per batch element: tileList{b}{th, tw} = [Gaussian indices],
-        % since each batch element is a different block/camera view.
-        tileList           % cell array {1 x miniBatchSize} of {numTilesH x numTilesW}
-        lastNumTilesH = -1 % Cache dimensions to detect resolution changes
-        lastNumTilesW = -1
+        % --- CPU-based Gaussian Lists (cached per batch) ---
+        % Pre-computed valid-Gaussian list per batch element, built once per
+        % batch on CPU (each batch element is a different block/camera view).
+        % No spatial tile subdivision — overlap is baked into ColmapData's
+        % overlapping block grid, so each canvas is rasterized as one unit.
+        tileList           % cell array {1 x miniBatchSize} of Gaussian-index vectors
 
         % --- CPU Bounding-Box Caches (filled by buildTileList) ---
         % [numValid x B] CPU singles so rasterizeToGPU computes pixel bounds
@@ -178,12 +176,11 @@ classdef GaussianSplatter < handle
             %   datasetPath  (string) : Path to the COLMAP dataset root.
             %   numGaussians (int)    : Number of Gaussians to initialise.
             %   numImages    (int)    : Number of training images to load.
-            %   blockSize    (1x2 int): Block/tile [H W]. Defaults to auto-select.
-            %                          Drives both the dataset's blockedImage
-            %                          grid (ColmapData) and the internal
-            %                          tile-culling loop in createImage.
-            %   overlap      (1x2 int): Border [H W] added around each block
-            %                          (blockedImageDatastore BorderSize).
+            %   blockSize    (1x2 int): Block [H W]. Defaults to auto-select.
+            %                          Drives the dataset's blockedImage grid
+            %                          (ColmapData) and the rasterizer canvas size.
+            %   overlap      (1x2 int): Halo [H W] added around each block via
+            %                          overlapping BlockOffsets (ColmapData).
             %                          Defaults to [0 0].
             %
             % BLOCKSIZE AUTO-SELECTION:
@@ -423,19 +420,15 @@ classdef GaussianSplatter < handle
         end
 
         function createImage(this, params)
-            % Tile-aware Gaussian Splatting rasterizer
+            % Gaussian Splatting rasterizer over the current block canvas.
             %
             % STAGE 1 (CPU): buildTileList() extracts bounding boxes ONCE
-            % per batch, pre-computes which Gaussians overlap each tile.
+            % per batch, pre-computes which Gaussians are valid for this
+            % batch's canvas (block overlap is already baked into
+            % ColmapData's block grid, so no further subdivision is needed).
             %
-            % STAGE 2 (GPU): rasterizeToGPU() processes pre-built tile lists
+            % STAGE 2 (GPU): rasterizeToGPU() processes the pre-built lists
             %   WITHOUT any extractdata() calls in the inner loop.
-            %
-            % The current block canvas (imageHeight x imageWidth) is
-            % partitioned into blockSize tiles. Per-tile Gaussian culling
-            % reduces work by skipping Gaussians whose bounding box does not
-            % overlap the tile (canvas is usually only 1-2 tiles now that
-            % blocks and tiles share the same blockSize).
             %
             % Gaussian falloff uses the standard 3DGS Mahalanobis distance:
             %   alpha_k(p) = exp(-0.5 * d^T * Sigma2D_inv_k * d)
@@ -469,20 +462,14 @@ classdef GaussianSplatter < handle
         end
 
         function tileList = buildTileList(this, numValid)
-            % CPU-based tile culling: build Gaussian-to-tile membership lists,
-            % one list per batch element (each element is a different block
-            % with different per-block camera intrinsics).
+            % CPU-based culling: build the valid-Gaussian list per batch
+            % element (each element is a different block with different
+            % per-block camera intrinsics). No spatial tile subdivision —
+            % block overlap already comes from ColmapData's block grid.
             %
             % Fully vectorized: one GPU→CPU sync for the whole batch, then
-            % per-tile membership via vectorized find() — no per-Gaussian
-            % append loop. Also caches CPU bounding boxes (uminCPU etc.) so
-            % rasterizeToGPU needs no per-Gaussian sync.
-
-            blockH = this.blockSize(1);
-            blockW = this.blockSize(2);
-
-            numTilesH = ceil(this.imageHeight / blockH);
-            numTilesW = ceil(this.imageWidth  / blockW);
+            % vectorized find() per batch element. Also caches CPU bounding
+            % boxes (uminCPU etc.) so rasterizeToGPU needs no per-Gaussian sync.
 
             % Extract bounding boxes once for all batch elements (SINGLE SYNC)
             u_all  = gather(reshape(extractdata(this.u_buffer(1:numValid, 1, 1, :)), numValid, []));
@@ -492,7 +479,7 @@ classdef GaussianSplatter < handle
 
             % CPU bounding boxes [numValid x B], reused by rasterizeToGPU.
             % Invalid slots carry radius -1 (sentinel from projection)
-            % → degenerate boxes → excluded by the overlap masks below.
+            % → degenerate boxes → excluded by the nondegenerate mask below.
             this.uminCPU = max(single(1.0), floor(u_all) - ru_all);
             this.umaxCPU = min(single(this.imageWidth),  ceil(u_all) + ru_all);
             this.vminCPU = max(single(1.0), floor(v_all) - rv_all);
@@ -501,133 +488,99 @@ classdef GaussianSplatter < handle
             tileList = cell(1, this.miniBatchSize);
 
             for b = 1:this.miniBatchSize
-                umin = this.uminCPU(:, b);
-                umax = this.umaxCPU(:, b);
-                vmin = this.vminCPU(:, b);
-                vmax = this.vmaxCPU(:, b);
+                nondegenerate = (this.uminCPU(:, b) <= this.umaxCPU(:, b)) & ...
+                                (this.vminCPU(:, b) <= this.vmaxCPU(:, b));
 
-                nondegenerate = (umin <= umax) & (vmin <= vmax);
-
-                tiles = cell(numTilesH, numTilesW);
-                for th = 1:numTilesH
-                    tVmin = single((th - 1) * blockH + 1);
-                    tVmax = single(min(th * blockH, this.imageHeight));
-                    for tw = 1:numTilesW
-                        tUmin = single((tw - 1) * blockW + 1);
-                        tUmax = single(min(tw * blockW, this.imageWidth));
-
-                        % find() preserves ascending index order == depth order
-                        tiles{th, tw} = find(nondegenerate & ...
-                            umin <= tUmax & umax >= tUmin & ...
-                            vmin <= tVmax & vmax >= tVmin);
-                    end
-                end
-
-                tileList{b} = tiles;
+                % find() preserves ascending index order == depth order
+                tileList{b} = find(nondegenerate);
             end
         end
 
         function rasterizeToGPU(this, numValid) %#ok<INUSD>
-            % Chunked, vectorized alpha compositing per tile.
+            % Chunked, vectorized alpha compositing over the full block canvas.
             %
             % Painter's algorithm reformulated without a serial per-Gaussian
             % dependency:  C(p) = sum_k c_k*alpha_k(p)*prod_{j<k}(1-alpha_j(p))
             %
             % Depth-sorted Gaussians are processed in chunks of chunkSize:
             %   1. Alpha maps for the whole chunk in one fused broadcast
-            %      [H' x W' x K] — one set of kernel launches per chunk
+            %      [H x W x K] — one set of kernel launches per chunk
             %      instead of per Gaussian.
             %   2. Within-chunk transmittance via cumprod along dim 3,
             %      detached from autodiff (extractdata) — same gradient
             %      semantics as the previous per-Gaussian version, which
             %      also excluded T from the tape.
-            %   3. Tile output accumulated in local accR/accG/accB and
-            %      written to this.image ONCE per tile, avoiding repeated
+            %   3. Output accumulated in local accR/accG/accB and written
+            %      to this.image ONCE per batch element, avoiding repeated
             %      dlarray copy-on-write subscripted assignments.
 
-            blockH = this.blockSize(1);
-            blockW = this.blockSize(2);
-            K      = this.chunkSize;
+            K = this.chunkSize;
 
             for b = 1:this.miniBatchSize
-                % Tile lists for this batch element's block/camera view
-                tiles = this.tileList{b};
+                gaussianList = this.tileList{b};
+                if isempty(gaussianList)
+                    continue;
+                end
 
-                for th = 1:size(tiles, 1)
-                    tileVmin = (th - 1) * blockH + 1;
-                    tileVmax = min(th * blockH, this.imageHeight);
+                x_t = this.X_vec;  % [1 x W]
+                y_t = this.Y_vec;  % [H x 1]
 
-                    for tw = 1:size(tiles, 2)
-                        gaussianList = tiles{th, tw};
-                        if isempty(gaussianList)
-                            continue;
-                        end
+                % Canvas-local transmittance carried across chunks
+                T_tile = ones(this.imageHeight, this.imageWidth, 'like', this.T);
 
-                        tileUmin = (tw - 1) * blockW + 1;
-                        tileUmax = min(tw * blockW, this.imageWidth);
+                accR = single(0);
+                accG = single(0);
+                accB = single(0);
 
-                        x_t = this.X_vec(tileUmin:tileUmax);  % [1 x W']
-                        y_t = this.Y_vec(tileVmin:tileVmax);  % [H' x 1]
+                numG = numel(gaussianList);
+                for c0 = 1:K:numG
+                    idx = gaussianList(c0:min(c0 + K - 1, numG));
 
-                        % Tile-local transmittance carried across chunks
-                        T_tile = ones(numel(y_t), numel(x_t), 'like', this.T);
+                    % Chunk parameters as [1 x 1 x K] for broadcasting
+                    u_c = reshape(stripdims(this.u_buffer(idx, 1, 1, b)), 1, 1, []);
+                    v_c = reshape(stripdims(this.v_buffer(idx, 1, 1, b)), 1, 1, []);
+                    a_c = reshape(stripdims(this.alphas_buffer(idx, 1, 1, b)), 1, 1, []);
+                    s11 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 1, b)), 1, 1, []);
+                    s12 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 2, b)), 1, 1, []);
+                    s22 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 2, 2, b)), 1, 1, []);
 
-                        accR = single(0);
-                        accG = single(0);
-                        accB = single(0);
+                    dx = x_t - u_c;  % [1 x W x K]
+                    dy = y_t - v_c;  % [H x 1 x K]
 
-                        numG = numel(gaussianList);
-                        for c0 = 1:K:numG
-                            idx = gaussianList(c0:min(c0 + K - 1, numG));
+                    % Fused Mahalanobis falloff for the whole chunk
+                    alpha = a_c .* exp(single(-0.5) .* ...
+                        (s11 .* dx.^2 + single(2.0) .* s12 .* (dy .* dx) + ...
+                         s22 .* dy.^2));  % [H x W x K]
 
-                            % Chunk parameters as [1 x 1 x K] for broadcasting
-                            u_c = reshape(stripdims(this.u_buffer(idx, 1, 1, b)), 1, 1, []);
-                            v_c = reshape(stripdims(this.v_buffer(idx, 1, 1, b)), 1, 1, []);
-                            a_c = reshape(stripdims(this.alphas_buffer(idx, 1, 1, b)), 1, 1, []);
-                            s11 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 1, b)), 1, 1, []);
-                            s12 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 2, b)), 1, 1, []);
-                            s22 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 2, 2, b)), 1, 1, []);
+                    % Transmittance is detached from autodiff (as before);
+                    % Tprev(:,:,k) = T before compositing chunk-Gaussian k
+                    alpha_nd = extractdata(alpha);
+                    Tk    = cumprod(single(1.0) - alpha_nd, 3);
+                    Tprev = cat(3, T_tile, T_tile .* Tk(:, :, 1:end-1));
 
-                            dx = x_t - u_c;  % [1  x W' x K]
-                            dy = y_t - v_c;  % [H' x 1  x K]
+                    w = alpha .* Tprev;  % dlarray composite weights
 
-                            % Fused Mahalanobis falloff for the whole chunk
-                            alpha = a_c .* exp(single(-0.5) .* ...
-                                (s11 .* dx.^2 + single(2.0) .* s12 .* (dy .* dx) + ...
-                                 s22 .* dy.^2));  % [H' x W' x K]
+                    cR = reshape(stripdims(this.colors_buffer(idx, 1, 1, b)), 1, 1, []);
+                    cG = reshape(stripdims(this.colors_buffer(idx, 1, 2, b)), 1, 1, []);
+                    cB = reshape(stripdims(this.colors_buffer(idx, 1, 3, b)), 1, 1, []);
 
-                            % Transmittance is detached from autodiff (as before);
-                            % Tprev(:,:,k) = T before compositing chunk-Gaussian k
-                            alpha_nd = extractdata(alpha);
-                            Tk    = cumprod(single(1.0) - alpha_nd, 3);
-                            Tprev = cat(3, T_tile, T_tile .* Tk(:, :, 1:end-1));
+                    accR = accR + sum(w .* cR, 3);
+                    accG = accG + sum(w .* cG, 3);
+                    accB = accB + sum(w .* cB, 3);
 
-                            w = alpha .* Tprev;  % dlarray composite weights
+                    T_tile = T_tile .* Tk(:, :, end);
 
-                            cR = reshape(stripdims(this.colors_buffer(idx, 1, 1, b)), 1, 1, []);
-                            cG = reshape(stripdims(this.colors_buffer(idx, 1, 2, b)), 1, 1, []);
-                            cB = reshape(stripdims(this.colors_buffer(idx, 1, 3, b)), 1, 1, []);
-
-                            accR = accR + sum(w .* cR, 3);
-                            accG = accG + sum(w .* cG, 3);
-                            accB = accB + sum(w .* cB, 3);
-
-                            T_tile = T_tile .* Tk(:, :, end);
-
-                            % Per-chunk early termination: one small sync per
-                            % chunk (amortized over chunkSize Gaussians);
-                            % skipped on the final chunk where it's useless.
-                            if c0 + K <= numG && ...
-                                    gather(max(T_tile, [], 'all')) < single(0.01)
-                                break;
-                            end
-                        end
-
-                        % Single write per tile (tiles are disjoint, image pre-zeroed)
-                        this.image(tileVmin:tileVmax, tileUmin:tileUmax, :, b) = ...
-                            cat(3, accR, accG, accB);
+                    % Per-chunk early termination: one small sync per
+                    % chunk (amortized over chunkSize Gaussians);
+                    % skipped on the final chunk where it's useless.
+                    if c0 + K <= numG && ...
+                            gather(max(T_tile, [], 'all')) < single(0.01)
+                        break;
                     end
                 end
+
+                % Single write per batch element (image pre-zeroed)
+                this.image(:, :, :, b) = cat(3, accR, accG, accB);
             end
         end
 
@@ -938,10 +891,10 @@ classdef GaussianSplatter < handle
             % than showing individual (scrambled, out-of-order) blocks.
             blockH = this.data.blockSize(1);
             blockW = this.data.blockSize(2);
-            padH   = this.data.overlap(1);
-            padW   = this.data.overlap(2);
-            coreRows = (padH+1):(padH+blockH);
-            coreCols = (padW+1):(padW+blockW);
+            % Overlap is trailing-only (baked into ColmapData's overlapping
+            % block grid), so each block's core starts at its own origin.
+            coreRows = 1:blockH;
+            coreCols = 1:blockW;
 
             % Cheap metadata-only pass (no pixel decode) to group blocks by source image.
             camRows = readall(this.data.cameras);
@@ -978,31 +931,28 @@ classdef GaussianSplatter < handle
 
                 blockRows = round(gather(extractdata(squeeze(camBlockRow))));
                 blockCols = round(gather(extractdata(squeeze(camBlockCol))));
-                numBlockRows = max(blockRows);
-                numBlockCols = max(blockCols);
 
                 predBlocks = gather(extractdata(this.image));
                 gtBlocks   = gather(extractdata(this.image_gt));
 
-                % Stitch blocks into full mosaics, cropping away each block's halo
-                % (overlap) so only its core blockSize region is placed in the canvas.
-                predFull = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
-                gtFull   = zeros(numBlockRows*blockH, numBlockCols*blockW, 3, 'single');
-
-                for b = 1:numBlocksForImage
-                    rowStart = (blockRows(b)-1)*blockH + 1;
-                    colStart = (blockCols(b)-1)*blockW + 1;
-                    predFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
-                        predBlocks(coreRows, coreCols, :, b);
-                    gtFull(rowStart:rowStart+blockH-1, colStart:colStart+blockW-1, :) = ...
-                        gtBlocks(coreRows, coreCols, :, b);
-                end
-
-                % Crop away PadPartialBlocks zero-padding beyond the true image extent
+                % Reassemble via a writable blockedImage: setBlock() places each
+                % core block at its tile-grid subscript, and gather() crops the
+                % result to imgSz automatically (no manual stitching/edge-crop).
                 imgNum = this.data.images.BlockLocationSet.ImageNumber(blockIdx(1));
                 imgSz  = this.data.images.Images(imgNum).Size;
-                predFull = predFull(1:min(end, imgSz(1)), 1:min(end, imgSz(2)), :);
-                gtFull   = gtFull(1:min(end, imgSz(1)),   1:min(end, imgSz(2)), :);
+
+                bimPred = blockedImage([], imgSz, [blockH, blockW, 3], single(0), Mode="w");
+                bimGT   = blockedImage([], imgSz, [blockH, blockW, 3], single(0), Mode="w");
+                for b = 1:numBlocksForImage
+                    setBlock(bimPred, [blockRows(b), blockCols(b), 1], predBlocks(coreRows, coreCols, :, b));
+                    setBlock(bimGT,   [blockRows(b), blockCols(b), 1], gtBlocks(coreRows, coreCols, :, b));
+                end
+
+                % gather() requires read mode after all blocks have been written
+                bimPred.Mode = 'r';
+                bimGT.Mode   = 'r';
+                predFull = gather(bimPred);
+                gtFull   = gather(bimGT);
 
                 subplot(ceil(numShow/floor(sqrt(numShow))), floor(sqrt(numShow)), n);
                 imshow(imtile(cat(4, predFull, gtFull)));

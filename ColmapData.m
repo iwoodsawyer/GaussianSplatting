@@ -276,19 +276,23 @@ classdef ColmapData < handle
                 end
             end
 
-            % Unlike BlockSize, BorderSize must match the blocked image's full
-            % dimensionality exactly (H,W,C) — pad with 0 for the channel dim.
-            borderSize = [obj.overlap, zeros(1, bims(1).NumDimensions - numel(obj.overlap))];
-
-            bimds = blockedImageDatastore(bims, 'BlockSize', obj.blockSize, ...
-                'BorderSize', borderSize, 'PadPartialBlocks', true, 'PadMethod', 0);
-
-            % Auto-generated block layout, in the exact order read() returns blocks.
-            bls       = bimds.BlockLocationSet;
-            numBlocks = size(bls.BlockOrigin, 1);
-
+            % Full read window = core blockSize + halo on both sides. BlockOffsets
+            % equal to the core blockSize (smaller than the full window) makes
+            % adjacent windows overlap by 2*overlap pixels — the halo is baked
+            % directly into the block grid instead of added via BorderSize.
+            % ExcludeIncompleteBlocks is left false so edge windows that overflow
+            % the image (common once the halo is added) are kept and zero-padded
+            % by PadMethod below, instead of being dropped outright.
             blockH = obj.blockSize(1) + 2 * obj.overlap(1);
             blockW = obj.blockSize(2) + 2 * obj.overlap(2);
+
+            bls = selectBlockLocations(bims, ...
+                BlockSize=[blockH, blockW], ...
+                BlockOffsets=obj.blockSize);
+
+            bimds = blockedImageDatastore(bims, BlockLocationSet=bls, PadMethod='replicate');
+
+            numBlocks = size(bls.BlockOrigin, 1);
 
             blockCams = repmat(struct('id', single(0), 'blockId', single(0), ...
                 'blockRow', single(0), 'blockCol', single(0), ...
@@ -307,8 +311,10 @@ classdef ColmapData < handle
                 worldOrd = bls.BlockOrigin(k, :);
                 worldOrd(1:2) = worldOrd([2 1]);
                 originRC  = world2sub(bims(imgIdx), worldOrd);
-                rowOffset = originRC(1) - 1 - obj.overlap(1);
-                colOffset = originRC(2) - 1 - obj.overlap(2);
+                % BlockOrigin is now the full window's own top-left corner (no
+                % separate core grid to offset from), so no overlap subtraction.
+                rowOffset = originRC(1) - 1;
+                colOffset = originRC(2) - 1;
 
                 % 1-based tile position of this block within its source
                 % image's grid — used to stitch blocks back together for
