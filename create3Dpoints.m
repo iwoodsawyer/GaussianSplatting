@@ -3,15 +3,23 @@
 % into a single point cloud. The approach is memory-efficient and prevents
 % over-drawing using grid-based downsampling (pcdownsample).
 %
+% Parameter decoding mirrors the latest GaussianSplatter:
+%   - Opacity:  sigmoid of alphas_raw, clamped to <= 1
+%   - Scale:    exp of scales_raw clamped to [-10, 10]
+%   - Rotation: normalized quaternion (Rodrigues rotation, same as R*diag(s))
+%   - Color:    per-channel second-order SH evaluation on shs [N x 9 x 3]
+%               (computeColors convention; view direction = normalized position)
+%
 % Dependencies: gaussians.mat produced by trainGaussianSplat.m
 
 clear; clc;
 
 % --- Configuration ---
 filename       = 'gaussians.mat';
-pointsPerSplat = 1e6;   % Points to generate per Gaussian (controls density)
-gridStep       = 0.1;   % Grid cell size for pcdownsample (visual resolution)
-alphaThresh    = 0.01;  % Minimum opacity — ignore near-transparent Gaussians
+pointsPerSplat = 1e6;    % Points to generate per Gaussian (controls density)
+gridStep       = 0.1;    % Grid cell size for pcdownsample (visual resolution)
+alphaThresh    = 0.018;  % ~ sigmoid(forcePruneThreshold = -4): near-invisible
+batchSize      = 5000;   % Gaussians processed per batch (bounds peak memory)
 
 %% 1. Load Trained Gaussian Parameters
 if ~isfile(filename)
@@ -19,14 +27,14 @@ if ~isfile(filename)
 end
 data = load(filename, 'params');
 
-% Helper: extract from dlarray/gpuArray to CPU double/single
-ext = @(x) gather(extractdata(x));
+% Helper: extract from dlarray/gpuArray to CPU single
+ext = @(x) single(gather(extractdata(x)));
 
-pws    = ext(data.params.pws);
-shs    = ext(data.params.shs);
-scales = ext(data.params.scales_raw);
-rots   = ext(data.params.rots_raw);
-alphas = ext(data.params.alphas_raw);
+pws        = ext(data.params.pws);         % [N x 3]
+shs        = ext(data.params.shs);         % [N x 9 x 3]
+scales_raw = ext(data.params.scales_raw);  % [N x 3]
+rots_raw   = ext(data.params.rots_raw);    % [N x 4]
+alphas_raw = ext(data.params.alphas_raw);  % [N x 1]
 
 % Zeroth-order and second-order spherical harmonic basis coefficients
 shToColor = single([0.28209479177387814; ...
@@ -39,85 +47,88 @@ shToColor = single([0.28209479177387814; ...
                     0.31539156525252005; ...
                     0.5462742152960396]);
 
-%% 2. Preallocate Point Cloud Array
 totalGaussians = size(pws, 1);
-ptCloud = repmat(pointCloud(zeros(0,3), 'Color', zeros(0,3)), totalGaussians, 1);
 fprintf('Total Gaussians loaded: %d\n', totalGaussians);
 
-%% 3. Densification Loop
-% For each Gaussian: evaluate opacity, sample points using Latin Hypercube
-% Sampling, rotate by the stored quaternion, and compute RGB from SH coefficients.
-fprintf('Processing and merging Gaussians...\n');
+%% 2. Decode Parameters (vectorized, matching GaussianSplatter)
+% Opacity: clamped sigmoid of raw logit
+alpha = min(single(1.0) ./ (single(1.0) + exp(-alphas_raw)), single(1.0));
 
-for i = 1:totalGaussians
+% Cull near-transparent Gaussians
+keep = alpha >= alphaThresh;
+pws        = pws(keep, :);
+shs        = shs(keep, :, :);
+scales_raw = scales_raw(keep, :);
+rots_raw   = rots_raw(keep, :);
+alpha      = alpha(keep, :);
+N = size(pws, 1);
+fprintf('Gaussians after opacity culling: %d\n', N);
 
-    % Extract per-Gaussian parameters
-    pw        = pws(i,:);
-    sh        = shs(i,:,:);
-    scale_raw = scales(i,:);
-    rot_raw   = rots(i,:);
-    alpha_raw = alphas(i,:);
+% Scale: exponentiate clamped log-domain values
+scale = exp(min(max(scales_raw, single(-10)), single(10)));
 
-    % Opacity: sigmoid of raw logit
-    alpha = 1 ./ (1 + exp(-alpha_raw));
+% Normalize quaternions to unit length
+quat = rots_raw ./ max(vecnorm(rots_raw, 2, 2), 1e-6);
 
-    % Skip near-transparent Gaussians (culling)
-    if all(alpha < alphaThresh)
-        continue;
-    end
+% Spherical harmonic colors, per channel (computeColors convention).
+% View direction = unit-normalized world position (no camera available).
+vd = pws ./ max(vecnorm(pws, 2, 2), 1e-6);
+vx = vd(:,1); vy = vd(:,2); vz = vd(:,3);
 
-    % Scale: exponentiate from log domain
-    scale = exp(scale_raw);
+c  = shToColor;
+Sh = [c(1) .* ones(N, 1, 'single'), ...
+      c(2) .* (-vx), ...
+      c(3) .* (-vy), ...
+      c(4) .* vz, ...
+      c(5) .* (vx .* vy), ...
+      c(6) .* (-vx .* vz), ...
+      c(7) .* (-vy .* vz), ...
+      c(8) .* (single(3.0) .* vz .* vz - single(1.0)), ...
+      c(9) .* (vx .* vx - vy .* vy)];                     % [N x 9]
 
-    % Number of sample points proportional to volume × opacity
-    nr_pts = ceil(prod(scale) .* alpha .* pointsPerSplat);
+colR = max(min(single(0.5) + sum(Sh .* shs(:,:,1), 2), single(1.0)), single(0.0));
+colG = max(min(single(0.5) + sum(Sh .* shs(:,:,2), 2), single(1.0)), single(0.0));
+colB = max(min(single(0.5) + sum(Sh .* shs(:,:,3), 2), single(1.0)), single(0.0));
+colors = [colR, colG, colB];                              % [N x 3]
 
-    % Latin Hypercube Sampling: generates well-distributed unit-cube samples
-    pts = single(lhsdesign(nr_pts, 3, 'criterion', 'correlation'));
+%% 3. Batched Densification
+% For each batch of Gaussians: sample points with Latin Hypercube Sampling,
+% rotate by the stored quaternion, translate to world space, and downsample.
+numBatches = ceil(N / batchSize);
+ptClouds   = repmat(pointCloud(zeros(0,3,'single')), numBatches, 1);
+fprintf('Processing %d batches...\n', numBatches);
 
-    % Map to Gaussian sphere via inverse normal CDF
-    pts = norminv(pts);
-    pts = pts .* scale;
+% Number of sample points proportional to volume x opacity
+nPtsPer = ceil(prod(scale, 2) .* alpha .* pointsPerSplat);
 
-    % Normalize quaternion to unit length
-    quat  = rot_raw;
-    quat  = quat ./ max(vecnorm(quat), 1e-6);
+for b = 1:numBatches
+    idx  = (b-1)*batchSize + 1 : min(b*batchSize, N);
+    nPts = nPtsPer(idx);
+    K    = sum(nPts);
+    gidx = repelem(idx(:), nPts);   % per-point Gaussian index
 
-    % Rotate sample points by the Gaussian's quaternion (Rodrigues' formula)
-    q_w   = ones(nr_pts, 1) * quat(:,1);
-    q_vec = ones(nr_pts, 1) * quat(:,2:4);
+    % Latin Hypercube Sampling mapped to Gaussian sphere via inverse normal CDF
+    pts = single(norminv(lhsdesign(K, 3, 'criterion', 'none')));
+
+    % Scale, then rotate by quaternion (Rodrigues; equals R*diag(s) in splatter)
+    pts   = pts .* scale(gidx, :);
+    q_w   = quat(gidx, 1);
+    q_vec = quat(gidx, 2:4);
     t     = 2 * cross(q_vec, pts, 2);
     pts   = pts + (q_w .* t) + cross(q_vec, t, 2);
 
-    % Translate to world-space Gaussian centre
-    pts = pw + pts;
+    % Translate to world-space Gaussian centres
+    pts = pts + pws(gidx, :);
 
-    % Unit-normalise position for spherical harmonic colour evaluation
-    pw_norm = pw ./ max(vecnorm(pw, 2, 2), 1e-6);
-
-    % Evaluate second-order spherical harmonic basis at normalised position
-    Sh = [shToColor(1), ...
-          shToColor(2) .* (-pw_norm(:,1)), ...
-          shToColor(3) .* (-pw_norm(:,2)), ...
-          shToColor(4) .* ( pw_norm(:,3)), ...
-          shToColor(5) .* ( pw_norm(:,1) .* pw_norm(:,2)), ...
-          shToColor(6) .* (-pw_norm(:,1) .* pw_norm(:,3)), ...
-          shToColor(7) .* (-pw_norm(:,2) .* pw_norm(:,3)), ...
-          shToColor(8) .* (single(3.0) .* pw_norm(:,3).^2 - single(1.0)), ...
-          shToColor(9) .* (pw_norm(:,1).^2 - pw_norm(:,2).^2)];
-
-    % RGB color: clamp SH expansion to [0, 1]
-    colors = reshape(max(min(0.5 + sum(Sh .* sh, 2), 1), 0), 1, 3);
-
-    % Build per-Gaussian point cloud
-    ptCloud(i) = pointCloud(pts, 'Color', colors);
+    % Downsample per batch to bound memory before the final merge
+    ptClouds(b) = pcdownsample(pointCloud(pts, 'Color', colors(gidx, :)), ...
+        "gridAverage", gridStep);
 end
 
 %% 4. Merge, Downsample, and Display
-% pccat concatenates all per-Gaussian point clouds into one.
-% pcdownsample with 'gridAverage' removes redundant points within each
-% grid cell, keeping the display memory-efficient.
-ptCloud = pccat(ptCloud);
+% pccat concatenates all per-batch point clouds into one.
+% A final pcdownsample removes redundant points across batch boundaries.
+ptCloud = pccat(ptClouds);
 ptCloud = pcdownsample(ptCloud, "gridAverage", gridStep);
 fprintf('Final point cloud size: %d points\n', ptCloud.Count);
 
