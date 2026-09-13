@@ -43,10 +43,12 @@
 % Specify the folder containing the SFM generated sparse 3D point cloud as
 % input, generated in COLMAP format. Download example dataset from:
 % https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
-datasetPath  = 'C:\Source\tandt_db\tandt\train'; % Update this path
-numGaussians = 2000; % More Gaussians creates sharper images, but needs more
-                     % memory and has longer training time.
-numImages    = 20;
+datasetPath      = 'C:\Source\tandt_db\tandt\train'; % Update this path
+initNumGaussians = 2000;  % Active Gaussian count at the start of training
+maxNumGaussians  = 10000; % Upper bound the active count grows to via densification.
+                          % More Gaussians creates sharper images, but needs more
+                          % memory and has longer training time.
+numImages        = 301;
 
 %% Blocked Image / Tile Settings
 % Block/tile size used both by ColmapData's blockedImageDatastore (dataset
@@ -63,17 +65,17 @@ overlapSize = [8, 8];
 
 %% Define Learnable Parameters
 % Construct object to load data and create learnable parameters.
-obj = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize, overlapSize);
+obj = GaussianSplatter(datasetPath, initNumGaussians, maxNumGaussians, numImages, blockSize, overlapSize);
 
 %% Specify Training Options
 % miniBatchSize now counts BLOCKS (not full images) per training step —
 % raise it to increase the number of blocked images processed per batch.
 totalNumBlocks = obj.data.images.TotalNumBlocks;
-miniBatchSize = 2*totalNumBlocks/numImages;
-numEpochs     = ceil(numGaussians / 20);
+miniBatchSize = 2*totalNumBlocks / numImages;
+numEpochs     = ceil(maxNumGaussians / 20);
 
 % Adam optimization options
-learnRate     = 0.02;
+learnRate     = 1 / numImages;
 learnInterval = ceil(numEpochs / 5);
 gradDecay     = 1 - miniBatchSize / totalNumBlocks;
 sqGradDecay   = 0.999;
@@ -83,7 +85,7 @@ sqGradDecay   = 0.999;
 % After setLevel(1), updateResolution() must be called to reallocate GPU
 % buffers (image, X, Y, T) to the new canvas dimensions. Without this,
 % buffers remain at half-resolution, clipping Gaussian projections.
-levelSwitchEpoch = max(1, floor(numEpochs * 0.3));
+levelSwitchEpoch = max(1, floor(numEpochs / 10));
 
 %% Train Model
 % To save time, load a pretrained network by setting doTraining to false.
@@ -112,9 +114,15 @@ mbq = minibatchqueue(ds, ...
     'MiniBatchFormat',  ["SSCB","CB","CB","CB","CB","CB","CB","CB","CB","CB","CB","SSCB","SCB","SCB"]);
 
 %% Adaptive Densification Settings
+% Each densify event either GROWS the active Gaussian count (by activating
+% more of the pre-loaded SfM point pool) or, once obj.numGaussians has
+% reached maxNumGaussians, PRUNES + clones/splits as before. Growth ramps
+% linearly over the first half of the scheduled densify events; the
+% second half (once at max) prunes exclusively.
 enableAdaptiveDensification = true;
 densifyInterval = ceil(numEpochs / 25);
 prunningRatio   = 0.05;
+growthIncrement = 2000;
 
 %% Initialize Adam Optimizer State
 avgGrad   = [];
@@ -227,21 +235,23 @@ if doTraining
                 imshow(extractdata(obj.image(:,:,:,idx)));
                 title(sprintf('Epoch %d | Loss: %.4f', epoch, loss));
                 drawnow;
-
-                % Print GPU Memory
-                obj.printGPUMemory(sprintf('[Periodic Monitoring] Epoch %d', epoch));
             end
         end
 
         % -----------------------------------------------------------------
-        % Adaptive densification: prune dead Gaussians and clone/split
-        % high-gradient ones to increase scene detail over time.
+        % Adaptive densification: while below maxNumGaussians, grow the
+        % active count from the pre-loaded SfM pool; only once at max does
+        % this prune dead Gaussians and clone/split high-gradient ones.
         % -----------------------------------------------------------------
         if enableAdaptiveDensification && ...
                 mod(epoch, densifyInterval) == 0 && ...
                 epoch > 1 && epoch < numEpochs
             obj.printGPUMemory(sprintf('[Before Densify] Epoch %d', epoch));
-            obj.pruneAndDensify(avgGrad, avgSqGrad, prunningRatio);
+            if obj.numGaussians < obj.maxNumGaussians
+                [avgGrad, avgSqGrad] = obj.growGaussians(avgGrad, avgSqGrad, obj.numGaussians + growthIncrement);
+            else
+                [avgGrad, avgSqGrad] = obj.pruneAndDensify(avgGrad, avgSqGrad, prunningRatio);
+            end
             obj.printGPUMemory(sprintf('[After Densify] Epoch %d', epoch));
         end
 

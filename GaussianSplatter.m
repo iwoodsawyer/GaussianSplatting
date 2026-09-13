@@ -71,7 +71,8 @@ classdef GaussianSplatter < handle
     properties
         % --- Sizes ---
         numImages
-        numGaussians
+        numGaussians     % Current ACTIVE Gaussian count (grows toward maxNumGaussians)
+        maxNumGaussians  % Upper bound numGaussians can grow to via growGaussians()
         miniBatchSize
         imageWidth
         imageHeight
@@ -168,20 +169,24 @@ classdef GaussianSplatter < handle
     end
 
     methods
-        function this = GaussianSplatter(datasetPath, numGaussians, numImages, blockSize, overlap)
+        function this = GaussianSplatter(datasetPath, initNumGaussians, maxNumGaussians, numImages, blockSize, overlap)
             % Constructor: load COLMAP data, initialise learnable parameters,
             % and create the separable SSIM Gaussian kernels.
             %
             % Args:
-            %   datasetPath  (string) : Path to the COLMAP dataset root.
-            %   numGaussians (int)    : Number of Gaussians to initialise.
-            %   numImages    (int)    : Number of training images to load.
-            %   blockSize    (1x2 int): Block [H W]. Defaults to auto-select.
-            %                          Drives the dataset's blockedImage grid
-            %                          (ColmapData) and the rasterizer canvas size.
-            %   overlap      (1x2 int): Halo [H W] added around each block via
-            %                          overlapping BlockOffsets (ColmapData).
-            %                          Defaults to [0 0].
+            %   datasetPath      (string) : Path to the COLMAP dataset root.
+            %   initNumGaussians (int)    : Number of Gaussians active at the start
+            %                              of training (grows via growGaussians()).
+            %   maxNumGaussians  (int)    : Upper bound the active Gaussian count
+            %                              can grow to. Also sizes the pre-loaded
+            %                              SfM point pool in ColmapData.
+            %   numImages        (int)    : Number of training images to load.
+            %   blockSize        (1x2 int): Block [H W]. Defaults to auto-select.
+            %                              Drives the dataset's blockedImage grid
+            %                              (ColmapData) and the rasterizer canvas size.
+            %   overlap          (1x2 int): Halo [H W] added around each block via
+            %                              overlapping BlockOffsets (ColmapData).
+            %                              Defaults to [0 0].
             %
             % BLOCKSIZE AUTO-SELECTION:
             %   If blockSize is empty or not provided, autoSelectBlockSize()
@@ -189,10 +194,10 @@ classdef GaussianSplatter < handle
             %   minimizes total blockedImageDatastore zero-padding summed
             %   over both the Half and Full resolution levels.
 
-            if nargin < 4 || isempty(blockSize)
+            if nargin < 5 || isempty(blockSize)
                 blockSize = GaussianSplatter.autoSelectBlockSize(datasetPath);
             end
-            if nargin < 5 || isempty(overlap)
+            if nargin < 6 || isempty(overlap)
                 overlap = [0, 0];
             end
 
@@ -212,13 +217,22 @@ classdef GaussianSplatter < handle
             end
 
             % Store sizes
-            this.datasetPath  = datasetPath;
-            this.numGaussians = numGaussians;
-            this.numImages    = numImages;
+            this.datasetPath = datasetPath;
+            this.numImages   = numImages;
 
             % Load data as a blockedImageDatastore; each read() returns one
             % block matching one (offset-adjusted) repeated camera entry.
-            this.data = ColmapData(datasetPath, numGaussians, numImages, blockSize, overlap);
+            % ColmapData loads/shuffles ALL SfM points and keeps up to
+            % maxNumGaussians of them — this pre-loaded pool is the source
+            % growGaussians() later activates from, so it's sized to
+            % maxNumGaussians rather than the smaller initial active count.
+            this.data = ColmapData(datasetPath, maxNumGaussians, numImages, blockSize, overlap);
+
+            % Clamp to the actual pool size (the SfM point cloud may hold
+            % fewer points than requested), then start active at initNumGaussians.
+            poolSize             = size(this.data.gaussians.pws, 1);
+            this.maxNumGaussians = min(maxNumGaussians, poolSize);
+            this.numGaussians    = min(initNumGaussians, this.maxNumGaussians);
 
             % Determine block canvas dimensions from the datastore preview.
             previewImg = preview(this.data.images);
@@ -227,8 +241,15 @@ classdef GaussianSplatter < handle
             end
             [this.imageHeight, this.imageWidth, this.imageChannel] = size(previewImg);
 
-            % Create learnable parameter struct (dlarray, CPU at this point)
-            this.params = this.createLearnableParams(this.data.gaussians);
+            % Create learnable parameter struct (dlarray, CPU at this point).
+            % Only the first numGaussians rows of the pre-loaded pool are
+            % active initially; growGaussians() activates more of it later.
+            initGaussians.pws    = this.data.gaussians.pws(1:this.numGaussians, :);
+            initGaussians.shs    = this.data.gaussians.shs(1:this.numGaussians, :);
+            initGaussians.scales = this.data.gaussians.scales(1:this.numGaussians, :);
+            initGaussians.rots   = this.data.gaussians.rots(1:this.numGaussians, :);
+            initGaussians.alphas = this.data.gaussians.alphas(1:this.numGaussians, :);
+            this.params = this.createLearnableParams(initGaussians);
 
             % Create the separable Gaussian kernels for differentiable SSIM loss
              [this.window_h, this.window_v] = this.createSeparableWindow(...
@@ -810,7 +831,64 @@ classdef GaussianSplatter < handle
             this.radii_v_buffer(:, :, :) = reshape(r_sorted, N, 1, B);
         end
 
-        function pruneAndDensify(this, avgGrad, avgSqGrad, prunningRatio)
+        function [avgGrad, avgSqGrad] = growGaussians(this, avgGrad, avgSqGrad, targetNumGaussians)
+            % Grow the ACTIVE Gaussian count toward targetNumGaussians (capped
+            % at maxNumGaussians) by activating the next chunk of the
+            % pre-shuffled SfM point pool already loaded in this.data.gaussians
+            % (ColmapData loads up to maxNumGaussians points up front), then
+            % reallocating GPU buffers to match.
+            newCount = min(round(targetNumGaussians), this.maxNumGaussians);
+            numToAdd = newCount - this.numGaussians;
+            if numToAdd <= 0
+                return;
+            end
+
+            addIdx = (this.numGaussians + 1):newCount;
+            newGaussians.pws    = this.data.gaussians.pws(addIdx, :);
+            newGaussians.shs    = this.data.gaussians.shs(addIdx, :);
+            newGaussians.scales = this.data.gaussians.scales(addIdx, :);
+            newGaussians.rots   = this.data.gaussians.rots(addIdx, :);
+            newGaussians.alphas = this.data.gaussians.alphas(addIdx, :);
+            newParams = this.createLearnableParams(newGaussians);
+
+            % Match device residency of the currently active params before concatenating
+            if this.useGPU
+                newParams.pws        = gpuArray(newParams.pws);
+                newParams.shs        = gpuArray(newParams.shs);
+                newParams.scales_raw = gpuArray(newParams.scales_raw);
+                newParams.alphas_raw = gpuArray(newParams.alphas_raw);
+                newParams.rots_raw   = gpuArray(newParams.rots_raw);
+            end
+
+            this.params.pws        = cat(1, this.params.pws,        newParams.pws);
+            this.params.shs        = cat(1, this.params.shs,        newParams.shs);
+            this.params.scales_raw = cat(1, this.params.scales_raw, newParams.scales_raw);
+            this.params.alphas_raw = cat(1, this.params.alphas_raw, newParams.alphas_raw);
+            this.params.rots_raw   = cat(1, this.params.rots_raw,   newParams.rots_raw);
+
+            % Pad Adam optimizer state with zeros so its size tracks params
+            % (adamupdate requires matching sizes on the next iteration)
+            if ~isempty(avgGrad)
+                avgGrad.pws        = cat(1, avgGrad.pws,        zeros(numToAdd, size(avgGrad.pws, 2),      'like', avgGrad.pws));
+                avgGrad.shs        = cat(1, avgGrad.shs,        zeros([numToAdd, size(avgGrad.shs, [2 3])], 'like', avgGrad.shs));
+                avgGrad.scales_raw = cat(1, avgGrad.scales_raw, zeros(numToAdd, size(avgGrad.scales_raw, 2), 'like', avgGrad.scales_raw));
+                avgGrad.alphas_raw = cat(1, avgGrad.alphas_raw, zeros(numToAdd, size(avgGrad.alphas_raw, 2), 'like', avgGrad.alphas_raw));
+                avgGrad.rots_raw   = cat(1, avgGrad.rots_raw,   zeros(numToAdd, size(avgGrad.rots_raw, 2),   'like', avgGrad.rots_raw));
+
+                avgSqGrad.pws        = cat(1, avgSqGrad.pws,        zeros(numToAdd, size(avgSqGrad.pws, 2),      'like', avgSqGrad.pws));
+                avgSqGrad.shs        = cat(1, avgSqGrad.shs,        zeros([numToAdd, size(avgSqGrad.shs, [2 3])], 'like', avgSqGrad.shs));
+                avgSqGrad.scales_raw = cat(1, avgSqGrad.scales_raw, zeros(numToAdd, size(avgSqGrad.scales_raw, 2), 'like', avgSqGrad.scales_raw));
+                avgSqGrad.alphas_raw = cat(1, avgSqGrad.alphas_raw, zeros(numToAdd, size(avgSqGrad.alphas_raw, 2), 'like', avgSqGrad.alphas_raw));
+                avgSqGrad.rots_raw   = cat(1, avgSqGrad.rots_raw,   zeros(numToAdd, size(avgSqGrad.rots_raw, 2),   'like', avgSqGrad.rots_raw));
+            end
+
+            this.numGaussians = newCount;
+            this.initStorage(this.miniBatchSize);
+
+            fprintf('Grew Gaussian set to %d (of max %d).\n', this.numGaussians, this.maxNumGaussians);
+        end
+
+        function [avgGrad, avgSqGrad] = pruneAndDensify(this, avgGrad, avgSqGrad, prunningRatio)
             % Adaptive densification: prune low-contribution Gaussians and
             % replace them with clones or splits of high-gradient Gaussians.
             %
