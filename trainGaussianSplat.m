@@ -72,7 +72,7 @@ obj = GaussianSplatter(datasetPath, initNumGaussians, maxNumGaussians, numImages
 % raise it to increase the number of blocked images processed per batch.
 totalNumBlocks = obj.data.images.TotalNumBlocks;
 miniBatchSize = 2*totalNumBlocks / numImages;
-numEpochs     = ceil(maxNumGaussians / 20);
+numEpochs     = ceil(3*maxNumGaussians / 100);
 
 % Adam optimization options
 learnRate     = 1 / numImages;
@@ -85,7 +85,7 @@ sqGradDecay   = 0.999;
 % After setLevel(1), updateResolution() must be called to reallocate GPU
 % buffers (image, X, Y, T) to the new canvas dimensions. Without this,
 % buffers remain at half-resolution, clipping Gaussian projections.
-levelSwitchEpoch = max(1, floor(numEpochs / 10));
+levelSwitchEpoch = max(1, floor(numEpochs / 3));
 
 %% Train Model
 % To save time, load a pretrained network by setting doTraining to false.
@@ -120,9 +120,9 @@ mbq = minibatchqueue(ds, ...
 % linearly over the first half of the scheduled densify events; the
 % second half (once at max) prunes exclusively.
 enableAdaptiveDensification = true;
-densifyInterval = ceil(numEpochs / 25);
+densifyInterval = ceil(numEpochs / 30);
 prunningRatio   = 0.05;
-growthIncrement = 2000;
+growthIncrement = 1000;
 
 %% Initialize Adam Optimizer State
 avgGrad   = [];
@@ -245,7 +245,7 @@ if doTraining
         % -----------------------------------------------------------------
         if enableAdaptiveDensification && ...
                 mod(epoch, densifyInterval) == 0 && ...
-                epoch > 1 && epoch < numEpochs
+                epoch > 1 && epoch < (2*numEpochs/3)
             obj.printGPUMemory(sprintf('[Before Densify] Epoch %d', epoch));
             if obj.numGaussians < obj.maxNumGaussians
                 [avgGrad, avgSqGrad] = obj.growGaussians(avgGrad, avgSqGrad, obj.numGaussians + growthIncrement);
