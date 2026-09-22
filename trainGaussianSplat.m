@@ -2,11 +2,6 @@
 % This example shows how-to train and generate 2D images using a
 % minimal implementation of 3D Gaussian splatting.
 %
-% GPU Target: NVIDIA RTX 4050 Laptop GPU
-%   - 6 GB GDDR6 VRAM
-%   - 192 GB/s memory bandwidth
-%   - 2560 CUDA cores (Ada Lovelace)
-%
 % Image Loading Design:
 %   Images are loaded as a blockedImageDatastore (ColmapData.images); each
 %   read() returns one fixed-size block (blockSize + 2*overlap), not a full
@@ -45,7 +40,7 @@
 % https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
 datasetPath      = 'C:\Source\tandt_db\tandt\train'; % Update this path
 initNumGaussians = 2000;  % Active Gaussian count at the start of training
-maxNumGaussians  = 10000; % Upper bound the active count grows to via densification.
+maxNumGaussians  = 20000; % Upper bound the active count grows to via densification.
                           % More Gaussians creates sharper images, but needs more
                           % memory and has longer training time.
 numImages        = 301;
@@ -61,7 +56,7 @@ numImages        = 301;
 % the size (per dimension, in [64, 160]) that minimizes total partial-block
 % zero-padding summed over both resolution levels.
 blockSize   = [];
-overlapSize = [8, 8];
+overlapSize = [5, 5]; % set to equal half SSIM window
 
 %% Define Learnable Parameters
 % Construct object to load data and create learnable parameters.
@@ -71,7 +66,7 @@ obj = GaussianSplatter(datasetPath, initNumGaussians, maxNumGaussians, numImages
 % miniBatchSize now counts BLOCKS (not full images) per training step —
 % raise it to increase the number of blocked images processed per batch.
 totalNumBlocks = obj.data.images.TotalNumBlocks;
-miniBatchSize = 2*totalNumBlocks / numImages;
+miniBatchSize = 32*totalNumBlocks / numImages;
 numEpochs     = ceil(3*maxNumGaussians / 100);
 
 % Adam optimization options

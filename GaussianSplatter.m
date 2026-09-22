@@ -520,17 +520,20 @@ classdef GaussianSplatter < handle
         function rasterizeToGPU(this, numValid) %#ok<INUSD>
             % Chunked, vectorized alpha compositing over the full block canvas.
             %
-            % Painter's algorithm reformulated without a serial per-Gaussian
+            % Front-to-back alpha compositing without a serial per-Gaussian
             % dependency:  C(p) = sum_k c_k*alpha_k(p)*prod_{j<k}(1-alpha_j(p))
+            % where k runs NEAR to FAR (list order from the ascending depth
+            % sort in projectGaussiansWithCulling).
             %
             % Depth-sorted Gaussians are processed in chunks of chunkSize:
             %   1. Alpha maps for the whole chunk in one fused broadcast
             %      [H x W x K] — one set of kernel launches per chunk
             %      instead of per Gaussian.
-            %   2. Within-chunk transmittance via cumprod along dim 3,
-            %      detached from autodiff (extractdata) — same gradient
-            %      semantics as the previous per-Gaussian version, which
-            %      also excluded T from the tape.
+            %   2. Within-chunk transmittance via a triangular-matmul
+            %      log-sum along dim 3 (cumsum/cumprod lack dlarray
+            %      support), kept ON the autodiff tape so opacity gradients
+            %      include the occlusion term (matches the reference 3DGS
+            %      backward pass).
             %   3. Output accumulated in local accR/accG/accB and written
             %      to this.image ONCE per batch element, avoiding repeated
             %      dlarray copy-on-write subscripted assignments.
@@ -568,15 +571,22 @@ classdef GaussianSplatter < handle
                     dx = x_t - u_c;  % [1 x W x K]
                     dy = y_t - v_c;  % [H x 1 x K]
 
-                    % Fused Mahalanobis falloff for the whole chunk
-                    alpha = a_c .* exp(single(-0.5) .* ...
+                    % Fused Mahalanobis falloff for the whole chunk;
+                    % clamped at 0.999 so transmittance never reaches 0
+                    alpha = min(a_c .* exp(single(-0.5) .* ...
                         (s11 .* dx.^2 + single(2.0) .* s12 .* (dy .* dx) + ...
-                         s22 .* dy.^2));  % [H x W x K]
+                         s22 .* dy.^2)), single(0.999));  % [H x W x K]
 
-                    % Transmittance is detached from autodiff (as before);
+                    % Differentiable transmittance; cumsum/cumprod lack
+                    % dlarray support, so the running log-sum uses a
+                    % triangular matmul (0.999 clamp keeps 1-alpha >= 1e-3,
+                    % so the log is safe).
                     % Tprev(:,:,k) = T before compositing chunk-Gaussian k
-                    alpha_nd = extractdata(alpha);
-                    Tk    = cumprod(single(1.0) - alpha_nd, 3);
+                    Kc    = size(alpha, 3);
+                    csM   = triu(ones(Kc, 'single', 'like', this.T));
+                    logT  = reshape(log(single(1.0) - alpha), [], Kc);  % [HW x K]
+                    Tk    = reshape(exp(logT * csM), ...
+                        this.imageHeight, this.imageWidth, Kc);
                     Tprev = cat(3, T_tile, T_tile .* Tk(:, :, 1:end-1));
 
                     w = alpha .* Tprev;  % dlarray composite weights
@@ -595,7 +605,7 @@ classdef GaussianSplatter < handle
                     % chunk (amortized over chunkSize Gaussians);
                     % skipped on the final chunk where it's useless.
                     if c0 + K <= numG && ...
-                            gather(max(T_tile, [], 'all')) < single(0.01)
+                            gather(extractdata(max(T_tile, [], 'all'))) < single(0.01)
                         break;
                     end
                 end
@@ -701,10 +711,12 @@ classdef GaussianSplatter < handle
                 return;
             end
 
-            % ---- Depth sort per batch column (back-to-front, invalid sink last)
+            % ---- Depth sort per batch column (front-to-back, invalid sink last)
+            % Front-to-back order is required by the compositing formula in
+            % rasterizeToGPU: earlier list entries occlude later ones.
             z_masked         = z_nd;
-            z_masked(~valid) = -Inf;
-            [~, sortOrder]   = sort(z_masked, 1, 'descend');  % [N x B]
+            z_masked(~valid) = Inf;
+            [~, sortOrder]   = sort(z_masked, 1, 'ascend');   % [N x B]
             linIdx  = sortOrder + (0:B-1) * N;                % linear into [N x B]
             rowMask = (1:N)' <= nr_valid;                     % valid-slot mask
 
