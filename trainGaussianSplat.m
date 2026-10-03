@@ -40,7 +40,8 @@
 % https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip
 datasetPath      = 'C:\Source\tandt_db\tandt\train'; % Update this path
 initNumGaussians = 2000;  % Active Gaussian count at the start of training
-maxNumGaussians  = 20000; % Upper bound the active count grows to via densification.
+maxNumGaussians  = 8000;  % 8000 - RTX4050, 20000 - RTX6000
+                          % Upper bound the active count grows to via densification.
                           % More Gaussians creates sharper images, but needs more
                           % memory and has longer training time.
 numImages        = 301;
@@ -66,12 +67,13 @@ obj = GaussianSplatter(datasetPath, initNumGaussians, maxNumGaussians, numImages
 % miniBatchSize now counts BLOCKS (not full images) per training step —
 % raise it to increase the number of blocked images processed per batch.
 totalNumBlocks = obj.data.images.TotalNumBlocks;
-miniBatchSize = 32*totalNumBlocks / numImages;
-numEpochs     = ceil(3*maxNumGaussians / 100);
+multiBatchSize = 2; % 2 - RTX4050, 30 - RTX6000
+miniBatchSize  = multiBatchSize * (totalNumBlocks / numImages);
+numEpochs      = ceil(3*maxNumGaussians / 200);
 
 % Adam optimization options
-learnRate     = 1 / numImages;
-learnInterval = ceil(numEpochs / 5);
+learnRate     = multiBatchSize / (10*numImages);
+learnInterval = ceil(numEpochs / 3);
 gradDecay     = 1 - miniBatchSize / totalNumBlocks;
 sqGradDecay   = 0.999;
 
@@ -117,7 +119,7 @@ mbq = minibatchqueue(ds, ...
 enableAdaptiveDensification = true;
 densifyInterval = ceil(numEpochs / 30);
 prunningRatio   = 0.05;
-growthIncrement = 1000;
+growthIncrement = 2000;
 
 %% Initialize Adam Optimizer State
 avgGrad   = [];

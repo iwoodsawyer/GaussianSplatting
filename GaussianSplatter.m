@@ -138,6 +138,10 @@ classdef GaussianSplatter < handle
         X_vec     % Pixel column coordinates [1 x W] plain gpuArray (separable)
         Y_vec     % Pixel row coordinates    [H x 1] plain gpuArray (separable)
         T         % Per-pixel transmittance  [H x W x 1] plain gpuArray
+        prefixSum % [K x K] strictly upper-triangular exclusive log-prefix-sum matrix
+
+        % Chunks between GPU->CPU early-termination syncs in rasterizeToGPU
+        earlyExitCheckInterval = 4;
 
         % --- Persistent Projection Buffers (reused every batch, allocated once) ---
         % Allocated in initStorage() and never deallocated. Every call to
@@ -329,6 +333,8 @@ classdef GaussianSplatter < handle
             % Per-pixel transmittance accumulator — reset to 1 per batch
             % Plain array (not dlarray) since T is not differentiated
             this.T = ones(this.imageHeight, this.imageWidth, 1, 'like', refArr);
+            % Column k sums entries j<k, giving transmittance BEFORE Gaussian k.
+            this.prefixSum = triu(ones(this.chunkSize, 'single', 'like', refArr), 1);
 
             % SSIM loss constants (plain array, not dlarray)
             this.C1 = cast(this.C1, 'like', refArr);
@@ -366,7 +372,7 @@ classdef GaussianSplatter < handle
             % --- Move learnable parameters to match data residency ---
             % No fresh array to hang 'like' off here (these already exist as
             % CPU dlarrays), so gate the move on the same useGPU decision.
-            if this.useGPU
+            if this.useGPU && ~isa(extractdata(this.params.pws), 'gpuArray')
                 fprintf('Moving learnable parameters to GPU...\n');
                 this.params.pws        = gpuArray(this.params.pws);
                 this.params.shs        = gpuArray(this.params.shs);
@@ -417,24 +423,24 @@ classdef GaussianSplatter < handle
             mu2_h = dlconv(this.image_gt, this.window_h, 0, 'Padding', 'same');
             mu2   = dlconv(mu2_h,         this.window_v, 0, 'Padding', 'same');
 
-            mu1_sq  = mu1.^2;
-            mu2_sq  = mu2.^2;
+            mu1_sq  = mu1 .* mu1;
+            mu2_sq  = mu2 .* mu2;
             mu1_mu2 = mu1 .* mu2;
 
             % Variance terms using separable convolution
-            im1_sq_h = dlconv(this.image.^2,               this.window_h, 0, 'Padding', 'same');
-            sigma1_sq = dlconv(im1_sq_h,                   this.window_v, 0, 'Padding', 'same') - mu1_sq;
+            im1_sq_h = dlconv(this.image .* this.image,       this.window_h, 0, 'Padding', 'same');
+            sigma1_sq = dlconv(im1_sq_h,                      this.window_v, 0, 'Padding', 'same') - mu1_sq;
 
-            im2_sq_h = dlconv(this.image_gt.^2,            this.window_h, 0, 'Padding', 'same');
-            sigma2_sq = dlconv(im2_sq_h,                   this.window_v, 0, 'Padding', 'same') - mu2_sq;
+            im2_sq_h = dlconv(this.image_gt .* this.image_gt, this.window_h, 0, 'Padding', 'same');
+            sigma2_sq = dlconv(im2_sq_h,                      this.window_v, 0, 'Padding', 'same') - mu2_sq;
 
-            im12_h = dlconv(this.image .* this.image_gt,   this.window_h, 0, 'Padding', 'same');
-            sigma12 = dlconv(im12_h,                       this.window_v, 0, 'Padding', 'same') - mu1_mu2;
+            im12_h = dlconv(this.image .* this.image_gt,      this.window_h, 0, 'Padding', 'same');
+            sigma12 = dlconv(im12_h,                          this.window_v, 0, 'Padding', 'same') - mu1_mu2;
 
             % SSIM map: numerator captures cross-correlation; denominator
             % normalises by the sum of individual variances.
             ssim_map = ((single(2.0) .* mu1_mu2 + this.C1) .* (single(2.0) .* sigma12   + this.C2)) ./ ...
-                       ((mu1_sq + mu2_sq + this.C1)         .* (sigma1_sq   + sigma2_sq  + this.C2));
+                       ((mu1_sq + mu2_sq + this.C1)        .* (sigma1_sq   + sigma2_sq  + this.C2));
 
             % Scalar SSIM: average over all spatial locations and channels
             ssim_val = mean(ssim_map, 'all');
@@ -457,11 +463,7 @@ classdef GaussianSplatter < handle
             % Gaussian centre, and Sigma2D_inv_k is the 2x2 inverse screen
             % covariance computed in projectGaussiansWithCulling via J*Sigma_cam*J^T.
             %
-            % Pixel radii for tile culling use separate horizontal and vertical
-            % bounds derived from eigenvalues of Sigma2D (3-sigma coverage).
-
-            % Reset rendered image to zero for this mini-batch
-            this.image(:) = 0;
+            % Pixel culling uses the exact axis-aligned 3-sigma bounding box.
 
             % Project all Gaussians; fills persistent buffers in-place
             % Returns the number of valid Gaussians for this batch
@@ -469,6 +471,8 @@ classdef GaussianSplatter < handle
 
             % Handle case where no valid Gaussians project to screen
             if numValid == 0
+                this.image = dlarray(zeros(this.imageHeight, this.imageWidth, 3, ...
+                    this.miniBatchSize, 'like', this.T), 'SSCB');
                 return;
             end
 
@@ -534,85 +538,102 @@ classdef GaussianSplatter < handle
             %      support), kept ON the autodiff tape so opacity gradients
             %      include the occlusion term (matches the reference 3DGS
             %      backward pass).
-            %   3. Output accumulated in local accR/accG/accB and written
+            %   3. Output accumulated in local RGB tensors and written
             %      to this.image ONCE per batch element, avoiding repeated
             %      dlarray copy-on-write subscripted assignments.
 
             K = this.chunkSize;
 
+            % Right multiplication yields exclusive log-prefix sums per Gaussian.
+            csM = this.prefixSum;
+            H = this.imageHeight;
+            W = this.imageWidth;
+
+            blocks = cell(1, this.miniBatchSize);
+
             for b = 1:this.miniBatchSize
                 gaussianList = this.tileList{b};
                 if isempty(gaussianList)
+                    blocks{b} = zeros(H, W, 3, 'like', this.T);
                     continue;
                 end
 
                 x_t = this.X_vec;  % [1 x W]
                 y_t = this.Y_vec;  % [H x 1]
 
-                % Canvas-local transmittance carried across chunks
-                T_tile = ones(this.imageHeight, this.imageWidth, 'like', this.T);
+                % Unformatted per-element views; indexed once per chunk below
+                ub   = stripdims(this.u_buffer(:, 1, 1, b));
+                vb   = stripdims(this.v_buffer(:, 1, 1, b));
+                ab   = stripdims(this.alphas_buffer(:, 1, 1, b));
+                s11b = stripdims(this.Sigma2D_inv_buffer(:, 1, 1, b));
+                s12b = stripdims(this.Sigma2D_inv_buffer(:, 1, 2, b));
+                s22b = stripdims(this.Sigma2D_inv_buffer(:, 2, 2, b));
+                cb   = reshape(stripdims(this.colors_buffer(:, 1, :, b)), [], 3);
 
-                accR = single(0);
-                accG = single(0);
-                accB = single(0);
+                % Canvas-local transmittance carried across chunks
+                T_tile = ones(H, W, 'like', this.T);
+                accRGB = zeros(H, W, 3, 'like', this.T);
 
                 numG = numel(gaussianList);
+                chunkIdx = 0;
                 for c0 = 1:K:numG
-                    idx = gaussianList(c0:min(c0 + K - 1, numG));
+                    chunkIdx = chunkIdx + 1;
+                    numReal = min(K, numG - c0 + 1);
+                    idx = gaussianList(c0:c0 + numReal - 1);
+                    if numReal < K
+                        % gaussianList is a column vector; pad along dim 1 to match
+                        idx = [idx; repmat(idx(end), K - numReal, 1)];
+                    end
 
                     % Chunk parameters as [1 x 1 x K] for broadcasting
-                    u_c = reshape(stripdims(this.u_buffer(idx, 1, 1, b)), 1, 1, []);
-                    v_c = reshape(stripdims(this.v_buffer(idx, 1, 1, b)), 1, 1, []);
-                    a_c = reshape(stripdims(this.alphas_buffer(idx, 1, 1, b)), 1, 1, []);
-                    s11 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 1, b)), 1, 1, []);
-                    s12 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 1, 2, b)), 1, 1, []);
-                    s22 = reshape(stripdims(this.Sigma2D_inv_buffer(idx, 2, 2, b)), 1, 1, []);
+                    u_c = reshape(ub(idx), 1, 1, K);
+                    v_c = reshape(vb(idx), 1, 1, K);
+                    a_c = reshape(ab(idx), 1, 1, K);
+                    if numReal < K
+                        mask = reshape([ones(1, numReal, 'like', this.T), zeros(1, K - numReal, 'like', this.T)], 1, 1, []);
+                        a_c = a_c .* mask;
+                    end
+                    s11 = reshape(s11b(idx), 1, 1, K);
+                    s12 = reshape(s12b(idx), 1, 1, K);
+                    s22 = reshape(s22b(idx), 1, 1, K);
 
                     dx = x_t - u_c;  % [1 x W x K]
                     dy = y_t - v_c;  % [H x 1 x K]
 
                     % Fused Mahalanobis falloff for the whole chunk;
                     % clamped at 0.999 so transmittance never reaches 0
-                    alpha = min(a_c .* exp(single(-0.5) .* ...
-                        (s11 .* dx.^2 + single(2.0) .* s12 .* (dy .* dx) + ...
-                         s22 .* dy.^2)), single(0.999));  % [H x W x K]
+                    mahal = single(-0.5) .* (s11 .* dx .* dx + single(2.0) .* s12 .* (dy .* dx) + s22 .* dy .* dy);
+                    alpha = min(a_c .* exp(mahal), single(0.999));
 
                     % Differentiable transmittance; cumsum/cumprod lack
                     % dlarray support, so the running log-sum uses a
                     % triangular matmul (0.999 clamp keeps 1-alpha >= 1e-3,
                     % so the log is safe).
-                    % Tprev(:,:,k) = T before compositing chunk-Gaussian k
-                    Kc    = size(alpha, 3);
-                    csM   = triu(ones(Kc, 'single', 'like', this.T));
-                    logT  = reshape(log(single(1.0) - alpha), [], Kc);  % [HW x K]
-                    Tk    = reshape(exp(logT * csM), ...
-                        this.imageHeight, this.imageWidth, Kc);
-                    Tprev = cat(3, T_tile, T_tile .* Tk(:, :, 1:end-1));
+                    % Exclusive prefix: Tprev(:,:,k) = T before chunk-Gaussian k
+                    logT  = reshape(log(single(1.0) - alpha), [], K);  % [HW x K]
+                    Tprev = T_tile .* reshape(exp(logT * csM), H, W, K);
 
                     w = alpha .* Tprev;  % dlarray composite weights
 
-                    cR = reshape(stripdims(this.colors_buffer(idx, 1, 1, b)), 1, 1, []);
-                    cG = reshape(stripdims(this.colors_buffer(idx, 1, 2, b)), 1, 1, []);
-                    cB = reshape(stripdims(this.colors_buffer(idx, 1, 3, b)), 1, 1, []);
+                    % Matrix multiplication replaces three 3D broadcast multiplies
+                    accRGB = accRGB + reshape(reshape(w, [], K) * cb(idx, :), H, W, 3);
 
-                    accR = accR + sum(w .* cR, 3);
-                    accG = accG + sum(w .* cG, 3);
-                    accB = accB + sum(w .* cB, 3);
+                    % Full-chunk product via column sum avoids a second K-wide matmul
+                    T_tile = T_tile .* reshape(exp(sum(logT, 2)), H, W);
 
-                    T_tile = T_tile .* Tk(:, :, end);
-
-                    % Per-chunk early termination: one small sync per
-                    % chunk (amortized over chunkSize Gaussians);
-                    % skipped on the final chunk where it's useless.
+                    % Early termination sync is a pipeline stall; check every
+                    % earlyExitCheckInterval chunks and never on the final one.
                     if c0 + K <= numG && ...
+                            mod(chunkIdx, this.earlyExitCheckInterval) == 0 && ...
                             gather(extractdata(max(T_tile, [], 'all'))) < single(0.01)
                         break;
                     end
                 end
 
-                % Single write per batch element (image pre-zeroed)
-                this.image(:, :, :, b) = cat(3, accR, accG, accB);
+                blocks{b} = accRGB;
             end
+
+            this.image = dlarray(cat(4, blocks{:}), 'SSCB');
         end
 
         function numValid = projectGaussiansWithCulling(this, params)
@@ -645,11 +666,9 @@ classdef GaussianSplatter < handle
             %   5. Invert 2x2 analytically:
             %        Sigma_2D_inv = inv(Sigma_2D)
             %
-            %   6. Pixel radii for tile culling (separate H and V, 3-sigma):
-            %        lambda_u = largest eigenvalue (used for horizontal radius)
-            %        lambda_v = smallest eigenvalue (used for vertical radius)
-            %        radius_u = ceil(3 * sqrt(lambda_u))
-            %        radius_v = ceil(3 * sqrt(lambda_v))
+            %   6. Axis-aligned 3-sigma half-extents for culling:
+            %        radius_u = ceil(3 * sqrt(Sigma2D_11))
+            %        radius_v = ceil(3 * sqrt(Sigma2D_22))
             %
             % Returns:
             %   numValid: number of Gaussians that passed frustum culling
@@ -674,13 +693,12 @@ classdef GaussianSplatter < handle
 
             N = size(params.pws, 1);
             B = this.miniBatchSize;
+            Rcw = reshape(stripdims(this.camera.Rcw), 3, 3, B);
 
             % ---- Camera-space positions for all Gaussians x batch [N x 3 x B]
             p_cam = pagemtimes( ...
-                repmat(params.pws, 1, 1, B), 'none', ...
-                stripdims(this.camera.Rcw), 'transpose');
-            p_cam = p_cam + repmat( ...
-                pagetranspose(reshape(stripdims(this.camera.tcw), 3, 1, B)), N, 1, 1);
+                params.pws, 'none', Rcw, 'transpose');
+            p_cam = p_cam + pagetranspose(reshape(stripdims(this.camera.tcw), 3, 1, B));
 
             x_cam  = reshape(p_cam(:, 1, :), N, B);
             y_cam  = reshape(p_cam(:, 2, :), N, B);
@@ -758,30 +776,55 @@ classdef GaussianSplatter < handle
             % Sigma_world = M * M^T  [3 x 3 x N]
             Sw = pagemtimes(M, 'none', M, 'transpose');
 
-            % ---- Camera-space covariance for all N x B (explicit page expansion)
-            RcwN = repmat(reshape(stripdims(this.camera.Rcw), 3, 3, 1, B), 1, 1, N, 1);
-            SwB  = repmat(reshape(Sw, 3, 3, N, 1), 1, 1, 1, B);
-            Scam = pagemtimes(pagemtimes(RcwN, SwB), 'none', RcwN, 'transpose');
+            % ---- Camera-space covariance for all N x B
+            W11 = reshape(Sw(1, 1, :), N, 1);
+            W12 = reshape(Sw(1, 2, :), N, 1);
+            W13 = reshape(Sw(1, 3, :), N, 1);
+            W22 = reshape(Sw(2, 2, :), N, 1);
+            W23 = reshape(Sw(2, 3, :), N, 1);
+            W33 = reshape(Sw(3, 3, :), N, 1);
 
-            S11 = reshape(Scam(1, 1, :, :), N, B);
-            S12 = reshape(Scam(1, 2, :, :), N, B);
-            S13 = reshape(Scam(1, 3, :, :), N, B);
-            S22 = reshape(Scam(2, 2, :, :), N, B);
-            S23 = reshape(Scam(2, 3, :, :), N, B);
-            S33 = reshape(Scam(3, 3, :, :), N, B);
+            r11 = reshape(Rcw(1, 1, :), 1, B);
+            r12 = reshape(Rcw(1, 2, :), 1, B);
+            r13 = reshape(Rcw(1, 3, :), 1, B);
+            r21 = reshape(Rcw(2, 1, :), 1, B);
+            r22 = reshape(Rcw(2, 2, :), 1, B);
+            r23 = reshape(Rcw(2, 3, :), 1, B);
+            r31 = reshape(Rcw(3, 1, :), 1, B);
+            r32 = reshape(Rcw(3, 2, :), 1, B);
+            r33 = reshape(Rcw(3, 3, :), 1, B);
+
+            S11 = W11 .* r11 .* r11 + W22 .* r12 .* r12 + W33 .* r13 .* r13 + ...
+                single(2.0) .* (W12 .* r11 .* r12 + W13 .* r11 .* r13 + W23 .* r12 .* r13);
+            S12 = W11 .* r11 .* r21 + W22 .* r12 .* r22 + W33 .* r13 .* r23 + ...
+                W12 .* (r11 .* r22 + r12 .* r21) + ...
+                W13 .* (r11 .* r23 + r13 .* r21) + ...
+                W23 .* (r12 .* r23 + r13 .* r22);
+            S13 = W11 .* r11 .* r31 + W22 .* r12 .* r32 + W33 .* r13 .* r33 + ...
+                W12 .* (r11 .* r32 + r12 .* r31) + ...
+                W13 .* (r11 .* r33 + r13 .* r31) + ...
+                W23 .* (r12 .* r33 + r13 .* r32);
+            S22 = W11 .* r21 .* r21 + W22 .* r22 .* r22 + W33 .* r23 .* r23 + ...
+                single(2.0) .* (W12 .* r21 .* r22 + W13 .* r21 .* r23 + W23 .* r22 .* r23);
+            S23 = W11 .* r21 .* r31 + W22 .* r22 .* r32 + W33 .* r23 .* r33 + ...
+                W12 .* (r21 .* r32 + r22 .* r31) + ...
+                W13 .* (r21 .* r33 + r23 .* r31) + ...
+                W23 .* (r22 .* r33 + r23 .* r32);
+            S33 = W11 .* r31 .* r31 + W22 .* r32 .* r32 + W33 .* r33 .* r33 + ...
+                single(2.0) .* (W12 .* r31 .* r32 + W13 .* r31 .* r33 + W23 .* r32 .* r33);
 
             % ---- Sigma_2D = J*Sigma_cam*J^T expanded elementwise.
             % J rows: j1 = [fx/z, 0, -fx*x/z^2], j2 = [0, fy/z, -fy*y/z^2],
             % so no [2x3xNxB] J matrices are materialized.
             t1 = fxr ./ z_safe;
-            t3 = -fxr .* x_cam ./ (z_safe .^ 2);
+            t3 = -fxr .* x_cam ./ (z_safe .* z_safe);
             w2 = fyr ./ z_safe;
-            w3 = -fyr .* y_cam ./ (z_safe .^ 2);
+            w3 = -fyr .* y_cam ./ (z_safe .* z_safe);
 
             % 0.3*I low-pass filter folded into the diagonal terms
-            a  = t1.^2 .* S11 + single(2.0) .* t1 .* t3 .* S13 + t3.^2 .* S33 + single(0.3);
+            a  = t1 .* t1 .* S11 + single(2.0) .* t1 .* t3 .* S13 + t3 .* t3 .* S33 + single(0.3);
             bb = (t1 .* S12 + t3 .* S23) .* w2 + (t1 .* S13 + t3 .* S33) .* w3;
-            d  = w2.^2 .* S22 + single(2.0) .* w2 .* w3 .* S23 + w3.^2 .* S33 + single(0.3);
+            d  = w2 .* w2 .* S22 + single(2.0) .* w2 .* w3 .* S23 + w3 .* w3 .* S33 + single(0.3);
 
             % Analytic 2x2 inverse [N x B]
             inv_det = single(1.0) ./ max(a .* d - bb .* bb, single(1e-6));
@@ -789,13 +832,11 @@ classdef GaussianSplatter < handle
             i12 = -bb .* inv_det;
             i22 =  a  .* inv_det;
 
-            % ---- Pixel radii from the larger Sigma2D eigenvalue (3-sigma, plain)
-            a_nd = extractdata(a);
-            b_nd = extractdata(bb);
-            d_nd = extractdata(d);
-            mid   = single(0.5) .* (a_nd + d_nd);
-            delta = sqrt(max(single(0.25) .* (a_nd - d_nd).^2 + b_nd.^2, single(0.0)));
-            r_all = ceil(single(3.0) .* sqrt(max(mid + delta, single(0.0))));  % [N x B]
+            % ---- Axis-aligned 3-sigma half-extents: the ellipse's exact bbox is
+            % +-3*sqrt(Sigma_11) horizontally and +-3*sqrt(Sigma_22) vertically.
+            % a, d >= 0.3 from the low-pass term, so sqrt is safe.
+            ru_all = ceil(single(3.0) .* sqrt(extractdata(a)));  % [N x B]
+            rv_all = ceil(single(3.0) .* sqrt(extractdata(d)));  % [N x B]
 
             % ---- Spherical harmonic colors for all N x B
             tw_r = reshape(stripdims(this.camera.twc), 1, 3, B);
@@ -825,6 +866,8 @@ classdef GaussianSplatter < handle
             % ---- Scatter depth-sorted values into persistent buffers (indexing only)
             this.u_buffer(:, :, :, :)      = reshape(u_all(linIdx),   N, 1, 1, B);
             this.v_buffer(:, :, :, :)      = reshape(v_all(linIdx),   N, 1, 1, B);
+            % alph is [N x 1] (batch-independent); sortOrder's [N x B] subscripts
+            % gather it per column, so linIdx (which offsets by N*B) would overrun.
             this.alphas_buffer(:, :, :, :) = reshape(alph(sortOrder), N, 1, 1, B);
 
             this.Sigma2D_inv_buffer(:, 1, 1, :) = reshape(i11(linIdx), N, 1, 1, B);
@@ -837,10 +880,12 @@ classdef GaussianSplatter < handle
             this.colors_buffer(:, 1, 3, :) = reshape(colB(linIdx), N, 1, 1, B);
 
             % Invalid slots get radius -1 → degenerate bbox → excluded downstream
-            r_sorted = r_all(linIdx);
-            r_sorted(~rowMask) = single(-1.0);
-            this.radii_u_buffer(:, :, :) = reshape(r_sorted, N, 1, B);
-            this.radii_v_buffer(:, :, :) = reshape(r_sorted, N, 1, B);
+            ru_sorted = ru_all(linIdx);
+            rv_sorted = rv_all(linIdx);
+            ru_sorted(~rowMask) = single(-1.0);
+            rv_sorted(~rowMask) = single(-1.0);
+            this.radii_u_buffer(:, :, :) = reshape(ru_sorted, N, 1, B);
+            this.radii_v_buffer(:, :, :) = reshape(rv_sorted, N, 1, B);
         end
 
         function [avgGrad, avgSqGrad] = growGaussians(this, avgGrad, avgSqGrad, targetNumGaussians)
