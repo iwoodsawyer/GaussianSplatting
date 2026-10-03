@@ -293,12 +293,12 @@ classdef GaussianSplatter < handle
         end
 
         function initStorage(this, miniBatchSize)
-            % Allocate all working GPU arrays.
+            % Allocate all working arrays on the current data device.
             %
             % Called once at the first training iteration and again by
-            % updateResolution() after a resolution switch. All arrays are
-            % created directly on the GPU so there is no deferred
-            % CPU-to-GPU copy.
+            % updateResolution() after a resolution switch. All arrays match
+            % the ground-truth data's type and CPU/GPU residency, avoiding
+            % deferred device transfers.
             %
             % Projection buffers are now allocated ONCE and reused across
             % all iterations. They are zeroed at the start of each batch
@@ -334,7 +334,7 @@ classdef GaussianSplatter < handle
             % Plain array (not dlarray) since T is not differentiated
             this.T = ones(this.imageHeight, this.imageWidth, 1, 'like', refArr);
             % Column k sums entries j<k, giving transmittance BEFORE Gaussian k.
-            this.prefixSum = triu(ones(this.chunkSize, 'single', 'like', refArr), 1);
+            this.prefixSum = triu(ones(this.chunkSize, 'like', refArr), 1);
 
             % SSIM loss constants (plain array, not dlarray)
             this.C1 = cast(this.C1, 'like', refArr);
