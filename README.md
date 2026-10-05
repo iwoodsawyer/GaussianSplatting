@@ -67,6 +67,42 @@ The COLMAP reader can also be used on its own:
 plot3([points.x], [points.y], [points.z], '.');  % view the sparse point cloud
 ```
 
+### 4. View trained Gaussians as a point cloud
+
+Run `create3Dpoints` to inspect the parameters in `gaussians.mat`. By default,
+`cloudMode = "centres"` shows one point per retained Gaussian without
+downsampling, and `colorMode = "dc"` uses view-independent spherical-harmonic
+DC colors. The initial view focuses on the 5th--95th position percentiles
+with Y pointing down (COLMAP convention). No points are removed by focusing;
+set `focusPercentiles = []` to display the full extent.
+
+Set `cloudMode = "sampled"` for the original batched densification. Adjust
+`pointsPerSplat` (sample density per volume times opacity), `batchSize`
+(Gaussians per batch), and `gridStep` (downsampled resolution). Large background
+Gaussians can dominate volume-weighted sampling and obscure the subject; coarse
+downsampling can also erase small-scale detail. Peak memory depends on sampled
+point count, not just Gaussian count. Counts are accumulated in double precision
+to keep sample rows and Gaussian indices aligned above 2^24 points.
+
+`colorMode = "sh"` evaluates view-dependent colors at `cameraPosition`
+(world coordinates, default `[0 0 0]`); colors do not update when rotating
+the viewer. A point cloud does **not** reproduce a Gaussian render's
+transparency, depth compositing, or view-dependent appearance. Use the training
+script's render preview for that comparison.
+
+To use the camera pose of a COLMAP image, set `datasetPath` to the dataset root
+and `imageId` to that image's COLMAP image ID in `create3Dpoints`. The script
+prints the camera centre in world coordinates and uses the image's position,
+forward direction, and image-up direction for the viewer and SH colors. This
+is the ID stored in `images.bin`, not the image's position in a sorted list or
+the number in its filename. Leave `imageId = []` to use the configured
+`cameraPosition` for SH colors and MATLAB's default viewer camera.
+
+The viewer uses Computer Vision Toolbox (`pointCloud`, `pcshow`); sampled mode
+also uses `pcdownsample` and `pccat`. Statistics and Machine Learning Toolbox
+is needed for percentile focusing (`prctile`) and sampling (`lhsdesign`,
+`norminv`).
+
 ## Repository Structure
 
 | File | Description |
@@ -75,6 +111,7 @@ plot3([points.x], [points.y], [points.z], '.');  % view the sparse point cloud
 | `GaussianSplatter.m` | Core class: learnable Gaussian parameters, GPU-vectorized projection/culling, tile-based rasterizer, L1+SSIM loss, densification |
 | `ColmapData.m` | Dataset wrapper: builds the blocked image / per-block camera datastores at two resolution levels, initializes Gaussians from SfM points |
 | `ColmapLoader.m` | Reader for COLMAP binary exports (`cameras.bin`, `images.bin`, `points3D.bin`) |
+| `create3Dpoints.m` | Focused Gaussian-centre inspection or batched sampling into a colored point cloud |
 | `gaussians.mat` | Pretrained Gaussians for the example dataset |
 | [`html/trainGaussianSplat.html`](html/trainGaussianSplat.html) | Published training script and results |
 
