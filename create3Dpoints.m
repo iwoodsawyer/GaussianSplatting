@@ -1,17 +1,56 @@
-%% View Gaussian Splats as a 3D Point Cloud
+%% VIEW GAUSSIAN SPLATS AS A 3-D POINT CLOUD
 % Inspect Gaussian centres without filling the scene with background splats.
-% Optional sampled mode densifies in batches and downsamples the result.
+% Sampled mode optionally densifies in batches and downsamples the result.
 %
-% Parameter decoding mirrors the latest GaussianSplatter:
-%   - Opacity:  sigmoid of alphas_raw, clamped to <= 1
-%   - Scale:    exp of scales_raw clamped to [-10, 10]
-%   - Rotation: normalized quaternion, matching the renderer's matrix layout
-%   - Color:    per-channel second-order SH evaluation on shs [N x 9 x 3]
-%               or view-independent DC color (default for inspection)
+% PARAMETER DECODING
+%   Decoding mirrors GaussianSplatter:
+%     Opacity  - sigmoid of alphas_raw, clamped to 1.
+%     Scale    - exp of scales_raw, clamped to [-10, 10].
+%     Rotation - normalized quaternion using the renderer's matrix layout.
+%     Color    - per-channel second-order SH evaluation on shs [N x 9 x 3],
+%                or view-independent DC color.
 %
-% Dependencies: gaussians.mat produced by trainGaussianSplat.m
-
-clear; clc;
+% USAGE
+%   create3Dpoints
+%
+% DESCRIPTION
+%   Inspect the parameters in gaussians.mat. With cloudMode = "centres", one
+%   point is shown per retained Gaussian without downsampling. colorMode =
+%   "dc" uses view-independent spherical-harmonic DC colors. The initial view
+%   focuses on positions between the 5th and 95th percentiles with Y pointing
+%   down (COLMAP convention).
+%   Focusing does not remove points; set focusPercentiles = [] to display the
+%   full extent.
+%
+%   Set cloudMode = "sampled" for the original batched densification. Adjust
+%   pointsPerSplat (sample density per volume times opacity), batchSize
+%   (Gaussians per batch), and gridStep (downsampled resolution). Large
+%   background Gaussians can dominate volume-weighted sampling and obscure
+%   the subject; coarse downsampling can also erase small-scale detail. Peak
+%   memory depends on sampled point count, not just Gaussian count. Counts are
+%   accumulated in double precision to keep sample rows and Gaussian indices
+%   aligned above 2^24 points.
+%
+%   colorMode = "sh" evaluates view-dependent colors at cameraPosition (world
+%   coordinates, default [0 0 0]); colors do not update when rotating the
+%   viewer. A point cloud does not reproduce a Gaussian render's transparency,
+%   depth compositing, or view-dependent appearance. Use the training script's
+%   render preview for that comparison.
+%
+%   To use the camera pose of a COLMAP image, set datasetPath to the dataset
+%   root and imageId to that image's COLMAP image ID. The script prints the
+%   camera centre in world coordinates and uses the image's position, forward
+%   direction, and image-up direction for the viewer and SH colors. This is
+%   the ID stored in images.bin, not the image's position in a sorted list or
+%   the number in its filename. Leave imageId = [] to use the configured
+%   cameraPosition for SH colors and MATLAB's default viewer camera.
+%
+% DEPENDENCIES
+%   gaussians.mat produced by trainGaussianSplat.m.
+%   Computer Vision Toolbox: pointCloud, pcshow; sampled mode also uses
+%   pcdownsample and pccat.
+%   Statistics and Machine Learning Toolbox: prctile for percentile focusing
+%   and lhsdesign and norminv for sampling.
 
 % --- Configuration ---
 filename       = 'gaussians.mat';
