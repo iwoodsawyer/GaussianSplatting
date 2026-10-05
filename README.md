@@ -1,7 +1,6 @@
 # 3D Gaussian Splatting in MATLAB
 
 [![View on File Exchange](https://www.mathworks.com/matlabcentral/images/matlab-file-exchange.svg)](https://www.mathworks.com/matlabcentral/fileexchange)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A minimal MATLAB implementation of **3D Gaussian Splatting (3DGS)** for novel-view synthesis, based on the formulation of Kerbl et al. (2023). It trains anisotropic 3D Gaussians from a COLMAP structure-from-motion reconstruction and renders images with a vectorized rasterizer. GPU acceleration is used when available, with CPU fallback.
 
@@ -132,6 +131,3 @@ is needed for percentile focusing (`prctile`) and sampling (`lhsdesign`,
 > ACM Transactions on Graphics (SIGGRAPH 2023).
 > <https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/>
 
-## License
-
-MIT License — see [LICENSE](LICENSE). Copyright (c) 2026 Ivo Houtzager.
