@@ -4,7 +4,7 @@
 
 A minimal MATLAB implementation of **3D Gaussian Splatting (3DGS)** for novel-view synthesis, based on the formulation of Kerbl et al. (2023). It trains anisotropic 3D Gaussians from a COLMAP structure-from-motion reconstruction and renders images with a vectorized rasterizer. GPU acceleration is used when available, with CPU fallback.
 
-[View the published training script and results](html/trainGaussianSplat.html).
+[View the published training script and results](https://iwoodsawyer.github.io/GaussianSplatting/html/trainGaussianSplat.html).
 
 ## Highlights
 
