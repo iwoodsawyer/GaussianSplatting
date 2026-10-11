@@ -1,6 +1,6 @@
 # 3D Gaussian Splatting in MATLAB
 
-[![View on File Exchange](https://www.mathworks.com/matlabcentral/images/matlab-file-exchange.svg)](https://www.mathworks.com/matlabcentral/fileexchange)
+[![View on File Exchange](https://www.mathworks.com/matlabcentral/images/matlab-file-exchange.svg)](https://www.mathworks.com/matlabcentral/fileexchange/183083-gaussian-splatting)
 
 A minimal MATLAB implementation of **3D Gaussian Splatting (3DGS)** for novel-view synthesis, based on the formulation of Kerbl et al. (2023). It trains anisotropic 3D Gaussians from a COLMAP structure-from-motion reconstruction and renders images with a vectorized rasterizer. GPU acceleration is used when available, with CPU fallback.
 
